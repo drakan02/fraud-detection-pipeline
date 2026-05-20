@@ -1,0 +1,3 @@
+{"ruleId":"P001","ruleName":"Rapid Small Transactions","enabled":true,"thresholdAmount":50.0,"windowSeconds":60,"minOccurrences":3,"severity":"HIGH"}
+{"ruleId":"P002","ruleName":"High Value New Location","enabled":true,"thresholdAmount":500.0,"windowSeconds":0,"minOccurrences":1,"severity":"CRITICAL"}
+{"ruleId":"P003","ruleName":"Multiple Fraud Then Success","enabled":true,"thresholdAmount":0.0,"windowSeconds":300,"minOccurrences":2,"severity":"HIGH"}

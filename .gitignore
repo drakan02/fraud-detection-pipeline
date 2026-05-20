@@ -1,0 +1,48 @@
+# =========================
+# Java & Maven
+# =========================
+target/
+*.jar
+*.war
+*.ear
+*.class
+dependency-reduced-pom.xml
+
+# =========================
+# Python & ML
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ml/data/
+ml/models/*.pkl
+*.egg-info/
+.pytest_cache/
+
+# =========================
+# Environment & Secrets
+# =========================
+.env
+.env.*
+!.env.example
+secrets.json
+kaggle.json
+
+# =========================
+# IDE & OS
+# =========================
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs & System
+# =========================
+*.log
+.agents/
