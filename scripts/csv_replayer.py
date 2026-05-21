@@ -28,7 +28,13 @@ def args():
     return p.parse_args()
 
 
-def to_txn(row, idx: int) -> dict:
+def to_txn(row, idx: int, base_ts: datetime) -> dict:
+    # Derive eventTime from CSV Time field (seconds elapsed since first transaction),
+    # mapped onto a real UTC timeline anchored at base_ts.
+    event_ts = datetime.fromtimestamp(
+        base_ts.timestamp() + float(row["Time"]),
+        tz=timezone.utc,
+    )
     return {
         "id":         str(uuid.uuid4()),
         "userId":     f"user_{idx % 500:04d}",
@@ -38,7 +44,7 @@ def to_txn(row, idx: int) -> dict:
         "merchantId": f"MER-{idx % 1000:04d}",
         "country":    COUNTRIES[idx % len(COUNTRIES)],
         "status":     "FRAUD" if int(row["Class"]) == 1 else "SUCCESS",
-        "eventTime":  datetime.now(timezone.utc).isoformat(),
+        "eventTime":  event_ts.isoformat(),
         "mlFeatures": {
             **{f"V{i}": float(row[f"V{i}"]) for i in range(1, 29)},
             "Amount": float(row["Amount"]),
@@ -59,11 +65,17 @@ def main():
     if a.fraud_only: df = df[df["Class"] == 1]
     if a.limit:      df = df.head(a.limit)
 
-    print(f"Replaying {len(df)} rows at {a.speed}x speed → {TOPIC}\n")
+    # Anchor point: treat the first row's Time=0 as "now" so the entire
+    # 48-hour dataset maps to [now, now + 172792s] in real UTC.
+    base_ts = datetime.now(timezone.utc)
+    print(f"Replaying {len(df)} rows at {a.speed}x speed → {TOPIC}")
+    print(f"Event-time base : {base_ts.isoformat()}")
+    print(f"Event-time range: +{df['Time'].max()/3600:.1f}h ({df['Time'].max():.0f}s)\n")
+
     prev_t, sent, fraud = None, 0, 0
 
     for idx, row in df.iterrows():
-        txn = to_txn(row, idx)
+        txn = to_txn(row, idx, base_ts)
         if prev_t is not None:
             delta = (float(row["Time"]) - prev_t) / a.speed
             if 0 < delta < 5:
@@ -75,7 +87,7 @@ def main():
         if txn["status"] == "FRAUD":
             fraud += 1
             print(f"[FRAUD] row={idx:6d} | {txn['userId']} | "
-                  f"€{txn['amount']:8.2f} | fraud_total={fraud}")
+                  f"€{txn['amount']:8.2f} | eventTime={txn['eventTime']} | fraud_total={fraud}")
         elif sent % 1000 == 0:
             print(f"[INFO]  sent={sent:6d} | fraud={fraud}")
 

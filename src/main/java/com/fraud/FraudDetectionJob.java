@@ -8,6 +8,7 @@ import com.fraud.model.FraudRule;
 import com.fraud.model.Transaction;
 import com.fraud.pattern.MultipleFailedPattern;
 import com.fraud.pattern.RapidSmallTransactionPattern;
+import com.fraud.pattern.MidRangeVelocityPattern;
 import com.fraud.serialization.FraudAlertSerializer;
 import com.fraud.serialization.FraudRuleDeserializer;
 import com.fraud.serialization.TransactionDeserializer;
@@ -111,6 +112,21 @@ public class FraudDetectionJob {
             });
         }
 
+        // ── Step 5b: CEP P004 — mid-range velocity (keyed by card) ───
+        DataStream<FraudAlert> p004Alerts;
+        {
+            PatternStream<Transaction> ps = CEP.pattern(
+                transactions.keyBy(t -> t.cardNumber),
+                MidRangeVelocityPattern.build(defaultP004Rule())
+            );
+            p004Alerts = ps.select(matches -> {
+                List<Transaction> hits = matches.get("first");
+                Transaction last = hits.get(hits.size() - 1);
+                return FraudAlert.cep(last, "P004", "Mid-Range Velocity", "MEDIUM",
+                    hits.size() + " transactions between 50-500 EUR within 600s on card " + last.cardNumber);
+            });
+        }
+
         // ── Step 6: Broadcast function (P002 + rule updates) ──────────────
         // Note: P002 is fully dynamic (enable/disable via Kafka, no restart needed).
         // P001 and P003 use hardcoded defaults matching rules.jsonl;
@@ -132,7 +148,7 @@ public class FraudDetectionJob {
 
         // ── Step 8: Merge all alert streams ───────────────────────────────
         DataStream<FraudAlert> allAlerts =
-            p001Alerts.union(p003Alerts, p002Stream, mlAlerts);
+            p001Alerts.union(p003Alerts, p004Alerts, p002Stream, mlAlerts);
 
         // ── Step 9: Sinks ─────────────────────────────────────────────────
         // Kafka alerts sink
@@ -161,6 +177,15 @@ public class FraudDetectionJob {
         r.ruleId = "P001"; r.ruleName = "Rapid Small Transactions";
         r.enabled = true; r.thresholdAmount = 50.0;
         r.windowSeconds = 60; r.minOccurrences = 3; r.severity = "HIGH";
+        return r;
+    }
+
+    // Default P004 rule matching rules.jsonl
+    private static com.fraud.model.FraudRule defaultP004Rule() {
+        FraudRule r = new FraudRule();
+        r.ruleId = "P004"; r.ruleName = "Mid-Range Velocity";
+        r.enabled = true; r.thresholdAmount = 50.0; r.thresholdAmountHigh = 500.0;
+        r.windowSeconds = 600; r.minOccurrences = 2; r.severity = "MEDIUM";
         return r;
     }
 }
