@@ -31,9 +31,9 @@ services:
     ports:
       - "${POSTGRES_PORT}:5432"
     environment:
-      POSTGRES_DB: frauddb
-      POSTGRES_USER: frauduser
-      POSTGRES_PASSWORD: fraudpass
+      POSTGRES_DB: ${POSTGRES_DB:-frauddb}
+      POSTGRES_USER: ${POSTGRES_USER:-frauduser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraudpass}
     volumes:
       - ./init-db:/docker-entrypoint-initdb.d
       - fraud_pg_data:/var/lib/postgresql/data
@@ -58,7 +58,7 @@ services:
     ports:
       - "${GRAFANA_PORT}:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: "fraudadmin"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-fraudadmin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fraud_pipeline.json
     volumes:

@@ -1,168 +1,192 @@
-# 🛡️ Real-Time Fraud Detection Pipeline v3.0
+# 🛡️ Hệ Thống Phát Hiện Gian Lận Theo Thời Gian Thực v3.0 (Real-Time Fraud Detection Pipeline)
 
-A complete, production-ready streaming pipeline for detecting credit card fraud in real-time. This project combines the power of **Apache Flink** for Complex Event Processing (CEP) and **Machine Learning** (XGBoost) deployed on FastAPI. It includes full observability via **Prometheus & Grafana**, dynamic **Model Versioning** with zero-downtime hot-swapping, and robust **Data Validation**.
-
----
-
-## 🏗️ Architecture & Data Flow
-
-The pipeline operates simultaneously on both rule-based heuristics and an AI-driven probability engine:
-
-1. **Data Ingestion (Simulated):** A Python replayer (`scripts/csv_replayer.py`) streams real Kaggle transaction datasets into a Kafka topic (`transactions`).
-2. **Dynamic Rule Injection:** Fraud rules (`rules.jsonl`) are injected into a secondary Kafka topic (`fraud-rules`) which are broadcasted across the cluster dynamically without downtime.
-3. **Stream Processing Engine (Apache Flink):**
-   - **Data Validation:** Validates incoming Kafka records and increments the `malformedMessages` Prometheus metric for corrupt/missing fields.
-   - **CEP Engine (Complex Event Processing):** Tracks time-windows and sequences (e.g., 3 micro-transactions under 60 seconds -> `P001` Alert; Multiple failed transactions followed by success -> `P003` Alert).
-   - **Broadcast State:** Matches real-time streams against the dynamic rule stream for immediate flagging (e.g., High-value transaction in a new location -> `P002` Alert).
-   - **Machine Learning (Async I/O):** Flink asynchronously queries the FastAPI server with transaction details. The XGBoost model calculates a fraud probability score.
-4. **Data Sinks:** Flink collects all fraud triggers and writes them back into Kafka (`fraud-alerts`) and directly into PostgreSQL (`fraud_alerts` and `transactions` tables) for analytics.
-5. **Observability:** Prometheus scrapes metrics from both Flink and FastAPI, and Grafana visualizes the real-time throughput, latency, and fraud alerts.
+Một hệ thống dữ liệu (data pipeline) hoàn chỉnh, sẵn sàng cho môi trường production dùng để phát hiện gian lận thẻ tín dụng theo thời gian thực. Dự án này kết hợp sức mạnh xử lý luồng sự kiện phức tạp (CEP) của **Apache Flink** và Engine học máy **Machine Learning** (XGBoost) được triển khai qua FastAPI. Hệ thống cũng đi kèm với tính năng giám sát toàn diện thông qua **Prometheus & Grafana**, khả năng thay đổi luật và mô hình ML linh hoạt (Hot-swapping / Model Versioning) mà không cần thời gian downtime (zero-downtime).
 
 ---
 
-## 📂 Project Structure
+## 🏗️ Kiến trúc & Luồng dữ liệu (Data Flow)
+
+Hệ thống hoạt động đồng thời dựa trên 2 nhánh: Các quy tắc cố định (Rule-based heuristics) và Trí tuệ nhân tạo (AI-driven probability engine).
+
+```mermaid
+graph TD
+    subgraph Tầng Thu thập (Ingestion)
+        R[CSV Replayer] -->|Gửi giao dịch| KT(Kafka: transactions)
+        RJ[rules.jsonl] -->|Gửi luật| KTR(Kafka: fraud-rules)
+    end
+
+    subgraph Tầng Xử lý Trung tâm (Apache Flink)
+        KT --> F[Flink: Data Validation & CEP]
+        KTR -.->|Broadcast Rules| F
+        F <-->|Async HTTP /predict| ML[FastAPI ML Server]
+    end
+
+    subgraph Tầng Lưu trữ & Cảnh báo (Sinks)
+        F -->|Cảnh báo gian lận| KFA(Kafka: fraud-alerts)
+        F -->|Lưu trữ dài hạn| PG[(PostgreSQL)]
+    end
+
+    subgraph Tầng Giám sát (Observability)
+        PROM[Prometheus] -.->|Scrape Metrics| F
+        PROM -.->|Scrape Metrics| ML
+        GRAF[Grafana] -.->|Query| PROM
+    end
+    
+    style F fill:#f96,stroke:#333,stroke-width:2px
+    style ML fill:#8f8,stroke:#333,stroke-width:2px
+```
+
+1. **Thu thập dữ liệu (Mô phỏng):** Một script Python (`scripts/csv_replayer.py`) đọc dữ liệu thẻ tín dụng từ Kaggle và giả lập đẩy các sự kiện (JSON) vào Kafka topic `transactions`.
+2. **Luật Động (Dynamic Rule Injection):** Các luật gian lận (`rules.jsonl`) được đẩy vào Kafka topic `fraud-rules` và được broadcast liên tục cho toàn bộ cụm Flink mà không cần khởi động lại.
+3. **Engine Xử Lý Luồng (Apache Flink):**
+   - **Data Validation:** Xác thực dữ liệu Kafka, nếu gặp data lỗi/thiếu trường, Flink sẽ ghi nhận vào metric `malformedMessages` thay vì làm sập pipeline.
+   - **CEP Engine:** Theo dõi chuỗi hành vi theo thời gian (VD: 3 giao dịch nhỏ dưới $10 trong 60 giây -> Cảnh báo `P001`; Nhiều lần bị từ chối sau đó thành công -> Cảnh báo `P003`).
+   - **Broadcast State:** Khớp dữ liệu thời gian thực với luật động (VD: Giao dịch số tiền lớn ở quốc gia lạ -> Cảnh báo `P002`).
+   - **Machine Learning (Async I/O):** Flink gọi bất đồng bộ đến FastAPI server để nhận điểm xác suất gian lận.
+4. **Data Sinks:** Các cảnh báo từ cả AI và luật được gộp lại và bắn ra Kafka (`fraud-alerts`) và PostgreSQL (`fraud_alerts`).
+5. **Observability:** Prometheus thu thập chỉ số (throughput, latency, tỷ lệ lỗi) từ Flink và FastAPI để Grafana trực quan hóa lên Dashboard.
+
+---
+
+## 📂 Cấu trúc Dự Án
 
 ```text
 .
-├── docker-compose.yml          # Infrastructure (Kafka, Zookeeper, Postgres, Prometheus, Grafana)
-├── .env                        # Environment variables for port configuration
-├── init-db/                    # PostgreSQL initialization scripts
-│   └── 01_schema.sql           # Schema for `transactions` and `fraud_alerts` tables
-├── ml/                         # Machine Learning Module
-│   ├── download_dataset.sh     # Script to pull Kaggle Credit Card dataset
-│   ├── train_model.py          # XGBoost training script with SMOTE & timestamp versioning
-│   ├── model_server.py         # FastAPI application with `/predict` and `/models` endpoints
-│   └── models/                 # Model registry (`model_registry.json`) and serialized models (.pkl)
-├── monitoring/                 # Observability Module
-│   ├── prometheus.yml          # Prometheus scraping configuration
-│   └── grafana/                # Grafana dashboards and provisioning configs
-├── pom.xml                     # Maven dependencies for the Flink Java application
-├── rules.jsonl                 # Static list of rules to broadcast
-├── scripts/                    # Utilities
-│   ├── create_topics.sh        # Kafka topic creation
-│   └── csv_replayer.py         # Transaction simulator pushing to Kafka
-└── src/main/java/com/fraud/    # Core Apache Flink Pipeline in Java
-    ├── config/                 # Pipeline configuration
+├── docker-compose.yml          # Triển khai Hạ tầng (Kafka, Postgres, Prometheus, Grafana)
+├── .env                        # Các biến môi trường và mật khẩu (Ports, Credentials)
+├── init-db/                    # Script khởi tạo PostgreSQL
+│   └── 01_schema.sql           # Schema cho bảng `transactions` và `fraud_alerts`
+├── ml/                         # Module Machine Learning
+│   ├── download_dataset.sh     # Tải dữ liệu Kaggle
+│   ├── train_model.py          # Script huấn luyện XGBoost (có áp dụng SMOTE)
+│   ├── model_server.py         # FastAPI quản lý `/predict` và `/models`
+│   ├── tests/                  # Bộ Test tự động cho FastAPI
+│   └── models/                 # Registry (`model_registry.json`) và các file .pkl
+├── monitoring/                 # Module Giám sát
+│   ├── prometheus.yml          # Cấu hình Prometheus Scraping
+│   └── grafana/                # Cấu hình và Dashboard Grafana
+├── pom.xml                     # Thư viện Maven cho Flink
+├── rules.jsonl                 # Danh sách luật động 
+├── scripts/                    # Các tiện ích
+│   ├── create_topics.sh        # Script tạo Kafka topics
+│   └── csv_replayer.py         # Trình mô phỏng giao dịch
+└── src/main/java/com/fraud/    # Mã nguồn trung tâm Apache Flink (Java 17)
+    ├── config/                 # Cấu hình Pipeline
     ├── function/               # Flink functions (Async ML Inference, Broadcast Rules)
     ├── model/                  # Data objects (Transaction, FraudAlert, FraudRule)
-    ├── pattern/                # Flink CEP Patterns (Rapid Small Txns, Multiple Failed)
-    ├── serialization/          # Kafka Deserializers with embedded Validation Metrics
-    ├── sink/                   # PostgreSQL JDBC Sinks
-    └── FraudDetectionJob.java  # Main Flink Entrypoint
+    ├── pattern/                # Flink CEP Patterns (Phân tích chuỗi hành vi)
+    ├── serialization/          # Kafka Deserializers & Validation
+    └── sink/                   # Kết nối PostgreSQL JDBC
 ```
 
 ---
 
-## 🛠️ Technology Stack
+## 🛠️ Công Nghệ Sử Dụng
 
 - **Stream Processing:** Apache Flink 1.20 (Java 17)
 - **Message Broker:** Apache Kafka 7.6 & Confluent ZooKeeper
 - **Database:** PostgreSQL 16
 - **Observability:** Prometheus & Grafana
 - **Machine Learning:** XGBoost, Scikit-Learn, Pandas
-- **Model Server:** FastAPI, Uvicorn, Python 3.12
-- **Build Tool:** Apache Maven
+- **Model Server:** FastAPI, Uvicorn, Python 3.12 (uv)
+- **Kiểm thử (Testing):** JUnit 5, Flink Test Utils, Pytest
 
 ---
 
-## ⚙️ Prerequisites
+## ⚙️ Yêu Cầu Cài Đặt (Prerequisites)
 
-Before starting, ensure your system has the following installed:
-- **Java 17** and **Maven 3.8+**
-- **Python 3.11/3.12** with `uv` or `pip`
-- **Docker 24+** (with Docker Compose v2)
-- **Apache Flink 1.20** extracted to your local machine (e.g., `~/flink-1.20.0`). 
-  - *Note: Ensure `flink-metrics-prometheus` JAR is placed in your Flink `plugins/metrics-prometheus/` folder.*
-  - *Note: Configure `metrics.reporter.prom.port: 9249-9260` in `config.yaml` to avoid port collisions.*
-- **Kaggle API Credentials** (`~/.kaggle/kaggle.json`) for downloading the model training dataset.
+- **Java 17** và **Maven 3.8+**
+- **Python 3.11/3.12** với `uv` hoặc `pip`
+- **Docker 24+** (hỗ trợ Docker Compose v2)
+- **Apache Flink 1.20** được giải nén sẵn (VD: `~/flink-1.20.0`). 
+  - *Lưu ý: Đảm bảo copy file JAR `flink-metrics-prometheus` vào thư mục `plugins/metrics-prometheus/` của Flink.*
+  - *Lưu ý: Chỉnh cấu hình `metrics.reporter.prom.port: 9249-9260` trong `config.yaml`.*
+- **Kaggle API Credentials** (`~/.kaggle/kaggle.json`) để tải dữ liệu training.
 
 ---
 
 ## 🗺️ Port Mapping
 
-*(Ports are configurable via `.env`)*
+*(Các port này có thể thay đổi linh hoạt thông qua file `.env`)*
 
-| Port       | Service                        | Usage                                     |
-|------------|--------------------------------|-------------------------------------------|
-| 8081       | Flink Web UI                   | Monitor Job Execution and Backpressure    |
-| 9093       | Kafka Broker (External)        | Connect producers/consumers via localhost |
-| 2182       | ZooKeeper                      | Cluster management                        |
-| 5433       | PostgreSQL                     | Access to `frauddb` (user: `frauduser`)   |
-| 8001       | FastAPI ML server              | `/predict`, `/models` and `/metrics`      |
-| 9090       | Prometheus                     | Scrape target monitoring                  |
-| 3000       | Grafana                        | View the Real-Time Fraud Dashboard        |
-| 9249-9260  | Flink Prometheus Reporters     | Exposes Flink internal and custom metrics |
+| Port       | Dịch vụ                        | Chức năng                               |
+|------------|--------------------------------|-----------------------------------------|
+| 8081       | Flink Web UI                   | Theo dõi Job Flink và Backpressure      |
+| 9093       | Kafka Broker (External)        | Nơi kết nối Kafka producer/consumer     |
+| 2182       | ZooKeeper                      | Quản lý Kafka cluster                   |
+| 5433       | PostgreSQL                     | Kết nối Database (`frauddb`)            |
+| 8001       | FastAPI ML server              | Endpoints: `/predict`, `/models`, `/metrics` |
+| 9090       | Prometheus                     | Giám sát metric                         |
+| 3000       | Grafana                        | Xem Dashboard Thời gian thực            |
+| 9249-9260  | Flink Prometheus Reporters     | Thu thập số liệu nội bộ của Flink       |
 
 ---
 
-## 🚀 Startup Order & Execution Guide
+## 🚀 Hướng Dẫn Khởi Chạy
 
-Follow these steps precisely to spin up the pipeline. It is recommended to use multiple terminal windows.
+Bạn nên sử dụng nhiều cửa sổ Terminal để chạy lần lượt các bước dưới đây.
 
-### 1. Infrastructure
-Spin up the Kafka, Zookeeper, Postgres, Prometheus, and Grafana containers:
+### 1. Hạ tầng (Infrastructure)
+Bật Kafka, Zookeeper, Postgres, Prometheus và Grafana. Đừng quên copy `.env.example` thành `.env` trước nhé!
 ```bash
 docker compose up -d
 ```
 
-### 2. Setup Kafka Topics & Publish Initial Rules
+### 2. Thiết lập Kafka & Nạp Luật ban đầu
 ```bash
-# Create transactions and fraud-alerts topics
+# Tạo các topics cần thiết
 ./scripts/create_topics.sh
 
-# Push JSON rules to Kafka for Flink to broadcast
+# Bắn file JSON vào Kafka để nạp luật động cho Flink
 cat rules.jsonl | docker exec -i fraud-kafka \
   kafka-console-producer --bootstrap-server localhost:9092 --topic fraud-rules
 ```
 
-### 3. Machine Learning Setup & Training
+### 3. Trí tuệ Nhân tạo (Machine Learning)
 ```bash
-# Activate Python environment (assuming a virtual environment is used)
-source .venv/bin/activate
-
-# Download dataset (requires Kaggle API key)
+# Tải bộ dataset (yêu cầu Kaggle API key)
 ./ml/download_dataset.sh
 
-# Train model (requires AUROC >= 0.85 to save). This creates a timestamped version.
-python ml/train_model.py
+# Huấn luyện mô hình XGBoost. (Chỉ lưu model nếu AUROC >= 0.85)
+uv run python ml/train_model.py
 ```
 
-### 4. Run the API Model Server (Terminal A)
-Keep this terminal open so Flink can communicate with the model and Prometheus can scrape `/metrics`.
+### 4. Bật API Model Server (Terminal A)
+Giữ Terminal này luôn chạy để Flink có thể giao tiếp với AI và Prometheus có thể lấy metric.
 ```bash
-uvicorn ml.model_server:app --host 0.0.0.0 --port 8001
+uv run uvicorn ml.model_server:app --host 0.0.0.0 --port 8001
 ```
 
-### 5. Start Apache Flink (Terminal B)
-Start the local Flink cluster.
+### 5. Khởi động Apache Flink (Terminal B)
+Bật cụm Flink cục bộ.
 ```bash
 export FLINK_HOME=~/flink-1.20.0
 $FLINK_HOME/bin/start-cluster.sh
 ```
-*Verify cluster is running by visiting [http://localhost:8081](http://localhost:8081).*
+*Truy cập [http://localhost:8081](http://localhost:8081) để kiểm tra UI của Flink.*
 
-### 6. Compile Java Code and Submit Job (Terminal C)
-Compile the Fat JAR (excluding tests for speed) and deploy it to Flink.
+### 6. Biên dịch Java Code và Nộp Job (Terminal C)
+Dùng Maven để đóng gói Fat JAR và triển khai lên Flink.
 ```bash
 mvn clean package -DskipTests
 $FLINK_HOME/bin/flink run -d target/fraud-detection-pipeline-1.0.jar
 ```
 
-### 7. Trigger the Data Stream (Terminal D)
-Run the replayer script to push transactions into Kafka at 5x the normal speed.
+### 7. Bật Trình Giả Lập Dữ Liệu (Terminal D)
+Script này sẽ giả vờ làm cổng thanh toán, bơm liên tục các giao dịch vào Kafka nhanh gấp 5 lần bình thường.
 ```bash
-python scripts/csv_replayer.py --speed 5
+uv run python scripts/csv_replayer.py --speed 5
 ```
 
 ---
 
-## 📊 Monitoring & Observability
+## 📊 Quan Sát (Monitoring & Observability)
 
-Once the data stream is running, you can monitor the pipeline in real-time:
+Sau khi dòng dữ liệu bắt đầu chảy, bạn có thể kiểm tra sức khỏe hệ thống:
 
-1. **Grafana Dashboard:** Visit `http://localhost:3000`. Navigate to **Dashboards > Fraud Pipeline**.
-   - Here you can monitor: Throughput (Records/sec), Model Server Latency, Processed Transactions, and Malformed Messages.
-2. **Database Verification:**
+1. **Grafana Dashboard:** Vào `http://localhost:3000` (User: `admin` / Pass: `fraudadmin` - hoặc xem trong `.env`). Mở **Dashboards > Fraud Pipeline**.
+   - Tại đây hiển thị: Tốc độ xử lý (Records/sec), Độ trễ của Model, Tổng giao dịch đã xử lý và số lượng dữ liệu lỗi (Malformed Messages).
+2. **Kiểm tra Database:**
    ```bash
    docker exec -i fraud-postgres psql -U frauduser -d frauddb -c "
    SELECT pattern_name, severity, amount, source FROM fraud_alerts LIMIT 5;
@@ -171,31 +195,44 @@ Once the data stream is running, you can monitor the pipeline in real-time:
 
 ---
 
-## 🧠 Model Versioning & Hot-Swapping
+## 🧠 Quản Lý Phiên Bản Model (Hot-Swapping)
 
-The Machine Learning server tracks a complete history of models in `model_registry.json`.
-If you need to tune or retrain the AI model over time:
+Server Machine Learning lưu toàn bộ lịch sử các mô hình đã huấn luyện trong `model_registry.json`.
+Giả sử bạn vừa tune lại thông số AI và muốn thay đổi mô hình ngay lập tức mà không muốn Flink bị gián đoạn:
 
-1. Run `python ml/train_model.py` to train a new model. A new timestamped version will be created.
-2. Check available versions:
+1. Chạy `uv run python ml/train_model.py` để ra version mới.
+2. Kiểm tra các version đang có sẵn:
    ```bash
    curl -s http://localhost:8001/models
    ```
-3. **Hot-Swap Model:** To activate a specific version (e.g. rollback) **without restarting Flink**:
+3. **Hot-Swap Model (Thay nóng):** Kích hoạt version mới (hoặc Rollback về version cũ):
    ```bash
    curl -X POST http://localhost:8001/models/<version-id>/activate
    ```
-   *The Model Server instantly reloads the specified model into memory, and Flink begins routing predictions through it immediately.*
+   *Ngay lập tức, Server AI sẽ nạp mô hình mới vào RAM, và Flink sẽ được dùng mô hình mới nhất này cho các giao dịch tiếp theo.*
 
 ---
 
-## 🛑 Shutdown Instructions
+## 🧪 Kiểm Thử (Automated Testing)
 
-To gracefully close all connections and terminate the cluster:
+Hệ thống được đảm bảo bằng bộ Test chạy song song trên 2 ngôn ngữ:
+- **Test Java (Flink CEP/Rules):** Đảm bảo không block nhầm khách hàng.
+  ```bash
+  mvn clean test
+  ```
+- **Test Python (FastAPI/ML Server):** Đảm bảo API scale dữ liệu chuẩn xác, và tính năng chuyển đổi model linh hoạt.
+  ```bash
+  uv run pytest ml/tests/
+  ```
+
+---
+
+## 🛑 Hướng Dẫn Tắt Hệ Thống
+
 ```bash
-# Stop Flink Cluster
+# Tắt Flink Cluster
 $FLINK_HOME/bin/stop-cluster.sh
 
-# Spin down Docker containers
+# Xóa các container Docker
 docker compose down
 ```
