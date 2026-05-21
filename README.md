@@ -10,23 +10,23 @@ Hệ thống hoạt động đồng thời dựa trên 2 nhánh: Các quy tắc 
 
 ```mermaid
 graph TD
-    subgraph Tầng Thu thập (Ingestion)
+    subgraph Ingestion ["Tầng Thu thập (Ingestion)"]
         R[CSV Replayer] -->|Gửi giao dịch| KT(Kafka: transactions)
         RJ[rules.jsonl] -->|Gửi luật| KTR(Kafka: fraud-rules)
     end
 
-    subgraph Tầng Xử lý Trung tâm (Apache Flink)
+    subgraph Flink ["Tầng Xử lý Trung tâm (Apache Flink)"]
         KT --> F[Flink: Data Validation & CEP]
         KTR -.->|Broadcast Rules| F
         F <-->|Async HTTP /predict| ML[FastAPI ML Server]
     end
 
-    subgraph Tầng Lưu trữ & Cảnh báo (Sinks)
+    subgraph Sinks ["Tầng Lưu trữ & Cảnh báo (Sinks)"]
         F -->|Cảnh báo gian lận| KFA(Kafka: fraud-alerts)
         F -->|Lưu trữ dài hạn| PG[(PostgreSQL)]
     end
 
-    subgraph Tầng Giám sát (Observability)
+    subgraph Observability ["Tầng Giám sát (Observability)"]
         PROM[Prometheus] -.->|Scrape Metrics| F
         PROM -.->|Scrape Metrics| ML
         GRAF[Grafana] -.->|Query| PROM
