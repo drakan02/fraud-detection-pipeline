@@ -20,15 +20,18 @@ def test_list_models(client):
     assert "active_version" in data
 
 def test_predict_legit(client):
-    # Payload matching TransactionFeatures schema
+    # Payload matching PredictRequest schema
     payload = {
-        "V1": -1.3, "V2": 0.5, "V3": 1.1, "V4": -0.2, "V5": 0.1,
-        "V6": 0.2, "V7": 0.1, "V8": 0.5, "V9": 0.1, "V10": -0.1,
-        "V11": 0.0, "V12": 0.1, "V13": 0.0, "V14": 0.1, "V15": 0.1,
-        "V16": 0.0, "V17": 0.1, "V18": 0.0, "V19": 0.1, "V20": 0.0,
-        "V21": 0.1, "V22": 0.2, "V23": -0.1, "V24": 0.0, "V25": 0.1,
-        "V26": 0.1, "V27": 0.0, "V28": 0.0,
-        "Time": 0.0, "Amount": 15.0
+        "transaction_id": "test-legit-tx-id",
+        "features": {
+            "V1": -1.3, "V2": 0.5, "V3": 1.1, "V4": -0.2, "V5": 0.1,
+            "V6": 0.2, "V7": 0.1, "V8": 0.5, "V9": 0.1, "V10": -0.1,
+            "V11": 0.0, "V12": 0.1, "V13": 0.0, "V14": 0.1, "V15": 0.1,
+            "V16": 0.0, "V17": 0.1, "V18": 0.0, "V19": 0.1, "V20": 0.0,
+            "V21": 0.1, "V22": 0.2, "V23": -0.1, "V24": 0.0, "V25": 0.1,
+            "V26": 0.1, "V27": 0.0, "V28": 0.0,
+            "Time": 0.0, "Amount": 15.0
+        }
     }
     
     response = client.post("/predict", json=payload)
@@ -43,13 +46,16 @@ def test_predict_legit(client):
 def test_predict_fraud(client):
     # A heavily anomalous transaction resembling fraud
     payload = {
-        "V1": -15.3, "V2": 10.5, "V3": -21.1, "V4": 6.2, "V5": -10.1,
-        "V6": -4.2, "V7": -18.1, "V8": 10.5, "V9": -5.1, "V10": -15.1,
-        "V11": 7.0, "V12": -12.1, "V13": 0.0, "V14": -12.1, "V15": -0.5,
-        "V16": -9.0, "V17": -15.1, "V18": -5.0, "V19": 2.1, "V20": 1.5,
-        "V21": 1.5, "V22": -0.5, "V23": -1.5, "V24": 0.2, "V25": 1.0,
-        "V26": 0.5, "V27": 1.5, "V28": 0.5,
-        "Time": 406.0, "Amount": 5000.0
+        "transaction_id": "test-fraud-tx-id",
+        "features": {
+            "V1": -15.3, "V2": 10.5, "V3": -21.1, "V4": 6.2, "V5": -10.1,
+            "V6": -4.2, "V7": -18.1, "V8": 10.5, "V9": -5.1, "V10": -15.1,
+            "V11": 7.0, "V12": -12.1, "V13": 0.0, "V14": -12.1, "V15": -0.5,
+            "V16": -9.0, "V17": -15.1, "V18": -5.0, "V19": 2.1, "V20": 1.5,
+            "V21": 1.5, "V22": -0.5, "V23": -1.5, "V24": 0.2, "V25": 1.0,
+            "V26": 0.5, "V27": 1.5, "V28": 0.5,
+            "Time": 406.0, "Amount": 5000.0
+        }
     }
     
     response = client.post("/predict", json=payload)

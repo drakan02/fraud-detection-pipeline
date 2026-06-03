@@ -32,6 +32,15 @@ data:
         detected_at DateTime64(3) DEFAULT now()
     ) ENGINE = ReplacingMergeTree()
     ORDER BY (detected_at, id);
+
+    CREATE TABLE IF NOT EXISTS default.model_predictions (
+        transaction_id String,
+        model_version String,
+        probability Float64,
+        prediction UInt8,
+        predicted_at DateTime64(3) DEFAULT now()
+    ) ENGINE = ReplacingMergeTree()
+    ORDER BY (predicted_at, transaction_id);
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

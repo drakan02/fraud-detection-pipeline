@@ -17,10 +17,15 @@ import threading
 from collections import deque
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Gauge
+import queue
+import httpx
+import asyncio
 
 def load_env():
     env_path = Path(".env")
@@ -134,9 +139,165 @@ def _load_version(version: str) -> None:
     model_info_gauge.labels(version=version, auroc=auroc).set(1)
 
 
+# ── ClickHouse & Monitoring Client ────────────────────────────────────────────
+CH_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
+CH_PORT = os.getenv("CLICKHOUSE_PORT", "30123")
+CH_USER = os.getenv("CLICKHOUSE_USER", "default")
+CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", "clickhousepass")
+CH_URL = f"http://{CH_HOST}:{CH_PORT}"
+
+def run_clickhouse_query(sql: str) -> dict:
+    r = httpx.post(
+        CH_URL,
+        params={"query": sql, "default_format": "JSON"},
+        auth=(CH_USER, CH_PASS),
+        timeout=10.0
+    )
+    if r.status_code != 200:
+        raise Exception(f"ClickHouse query failed: {r.text}")
+    return r.json()
+
+def run_clickhouse_write(sql: str, data: str = None) -> None:
+    headers = {"Content-Type": "text/plain"}
+    r = httpx.post(
+        CH_URL,
+        params={"query": sql},
+        content=data,
+        auth=(CH_USER, CH_PASS),
+        headers=headers,
+        timeout=10.0
+    )
+    if r.status_code != 200:
+        raise Exception(f"ClickHouse write failed: {r.text}")
+
+prediction_queue = queue.Queue()
+
+def clickhouse_writer_thread():
+    while True:
+        try:
+            item = prediction_queue.get(timeout=1.0)
+            batch = [item]
+            while not prediction_queue.empty() and len(batch) < 100:
+                try:
+                    batch.append(prediction_queue.get_nowait())
+                except queue.Empty:
+                    break
+            
+            lines = []
+            for item in batch:
+                lines.append(json.dumps({
+                    "transaction_id": item["transaction_id"],
+                    "model_version": item["model_version"],
+                    "probability": item["probability"],
+                    "prediction": int(item["prediction"])
+                }))
+            data = "\n".join(lines) + "\n"
+            
+            sql = "INSERT INTO default.model_predictions FORMAT JSONEachRow"
+            try:
+                run_clickhouse_write(sql, data)
+            except Exception as e:
+                print(f"Error writing batch to ClickHouse: {e}")
+                
+            for _ in range(len(batch)):
+                prediction_queue.task_done()
+                
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error in ClickHouse writer thread: {e}")
+
+active_connections = []
+
+async def broadcast_loop():
+    while True:
+        await asyncio.sleep(2.0)
+        if not active_connections:
+            continue
+        try:
+            sql_models = "SELECT DISTINCT model_version FROM default.model_predictions"
+            try:
+                res = await asyncio.to_thread(run_clickhouse_query, sql_models)
+                model_versions = [row["model_version"] for row in res.get("data", [])]
+            except Exception as e:
+                print(f"Error getting models: {e}")
+                model_versions = []
+                
+            active_ver = _state.get("version", "latest")
+            if active_ver not in model_versions:
+                model_versions.append(active_ver)
+                
+            data = {"models": {}, "active_version": active_ver}
+            for version in model_versions:
+                if not version:
+                    continue
+                stats_sql = f"""
+                SELECT
+                    count() AS total,
+                    countIf(status = 'FRAUD' AND prediction = 1) AS tp,
+                    countIf(status = 'SUCCESS' AND prediction = 1) AS fp,
+                    countIf(status = 'SUCCESS' AND prediction = 0) AS tn,
+                    countIf(status = 'FRAUD' AND prediction = 0) AS fn
+                FROM (
+                    SELECT
+                        t.status AS status,
+                        p.prediction AS prediction
+                    FROM default.transactions AS t
+                    INNER JOIN default.model_predictions AS p ON t.id = p.transaction_id
+                    WHERE p.model_version = '{version}'
+                )
+                """
+                try:
+                    stats_res = await asyncio.to_thread(run_clickhouse_query, stats_sql)
+                    rows = stats_res.get("data", [])
+                    if rows and int(rows[0].get("total", 0)) > 0:
+                        row = rows[0]
+                        tp = int(row.get("tp", 0))
+                        fp = int(row.get("fp", 0))
+                        tn = int(row.get("tn", 0))
+                        fn = int(row.get("fn", 0))
+                        total = tp + fp + tn + fn
+                        
+                        accuracy = (tp + tn) / total if total > 0 else 0.0
+                        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                        
+                        data["models"][version] = {
+                            "total": total,
+                            "accuracy": round(accuracy, 4),
+                            "precision": round(precision, 4),
+                            "recall": round(recall, 4),
+                            "f1": round(f1, 4),
+                            "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn}
+                        }
+                    else:
+                        data["models"][version] = {
+                            "total": 0,
+                            "accuracy": 0.0,
+                            "precision": 0.0,
+                            "recall": 0.0,
+                            "f1": 0.0,
+                            "confusion_matrix": {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+                        }
+                except Exception as e:
+                    print(f"Error getting stats for version {version}: {e}")
+            
+            payload = json.dumps(data)
+            for conn in list(active_connections):
+                try:
+                    await conn.send_text(payload)
+                except Exception:
+                    if conn in active_connections:
+                        active_connections.remove(conn)
+        except Exception as e:
+            print(f"Error in broadcast loop: {e}")
+
 @app.on_event("startup")
-def startup():
+async def startup():
     _load_version("latest")
+    threading.Thread(target=clickhouse_writer_thread, daemon=True).start()
+    asyncio.create_task(broadcast_loop())
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -152,6 +313,11 @@ class TransactionFeatures(BaseModel):
     V26:float; V27:float; V28:float
     Amount: float = Field(..., ge=0)
     Time:   float = Field(..., ge=0)
+
+
+class PredictRequest(BaseModel):
+    transaction_id: str
+    features: TransactionFeatures
 
 
 class PredictionResult(BaseModel):
@@ -171,14 +337,23 @@ def health():
 
 
 @app.post("/predict", response_model=PredictionResult)
-def predict(f: TransactionFeatures):
+def predict(req: PredictRequest):
     try:
+        f = req.features
         raw = np.array([[getattr(f, feat) for feat in FEATURE_NAMES]])
         raw[0, 28] = float(_state["amount_scaler"].transform([[f.Amount]])[0][0])
         raw[0, 29] = float(_state["time_scaler"].transform([[f.Time]])[0][0])
 
         prob = float(_state["model"].predict_proba(raw)[0][1])
         is_fraud = prob >= float(os.getenv("ML_THRESHOLD", "0.5"))
+
+        # Queue prediction for ClickHouse analytical logging
+        prediction_queue.put({
+            "transaction_id": req.transaction_id,
+            "model_version": _state.get("version", "unknown"),
+            "probability": prob,
+            "prediction": 1 if is_fraud else 0
+        })
 
         fraud_predictions.labels(is_fraud=str(is_fraud).lower()).inc()
 
@@ -228,6 +403,9 @@ def list_models():
 @app.post("/models/{version}/activate")
 def activate_model(version: str):
     """Hot-swap to a specific model version without restarting the server."""
+    import re
+    if not re.match(r"^[a-zA-Z0-9_]+$", version):
+        raise HTTPException(status_code=400, detail="Invalid version format. Only alphanumeric characters and underscores are allowed.")
     try:
         _load_version(version)
         return {"status": "ok", "active_version": version}
@@ -235,6 +413,73 @@ def activate_model(version: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/predictions")
+def get_predictions(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0)
+):
+    sql = f"""
+    SELECT
+        p.transaction_id AS transaction_id,
+        p.model_version AS model_version,
+        p.probability AS probability,
+        p.prediction AS prediction,
+        t.status AS actual_status,
+        p.predicted_at AS predicted_at
+    FROM default.model_predictions AS p
+    LEFT JOIN default.transactions AS t ON p.transaction_id = t.id
+    ORDER BY p.predicted_at DESC
+    LIMIT {limit} OFFSET {offset}
+    """
+    try:
+        res = run_clickhouse_query(sql)
+        rows = res.get("data", [])
+        for row in rows:
+            if "predicted_at" in row and row["predicted_at"] is not None:
+                row["predicted_at"] = str(row["predicted_at"])
+        return {"data": rows, "limit": limit, "offset": offset}
+    except Exception as e:
+        print(f"Error fetching predictions: {e}")
+        return {"data": [], "limit": limit, "offset": offset, "error": str(e)}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+
+
+@app.get("/")
+def serve_ui():
+    import os
+    if os.path.exists("ml/static/index.html"):
+        return FileResponse("ml/static/index.html")
+    return {"message": "Welcome to Fraud Detection Model & Dashboard Server. (Dashboard UI not built yet)"}
+
+
+@app.get("/vite.svg")
+def serve_favicon():
+    import os
+    if os.path.exists("ml/static/vite.svg"):
+        return FileResponse("ml/static/vite.svg")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
+
+import os
+os.makedirs("ml/static", exist_ok=True)
+if os.path.exists("ml/static/assets"):
+    app.mount("/assets", StaticFiles(directory="ml/static/assets"), name="assets")
+app.mount("/static", StaticFiles(directory="ml/static"), name="static")
 
 
 if __name__ == "__main__":

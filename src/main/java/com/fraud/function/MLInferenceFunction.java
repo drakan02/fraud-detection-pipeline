@@ -69,7 +69,10 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
             return;
         }
         try {
-            String body = mapper.writeValueAsString(txn.mlFeatures);
+            java.util.Map<String, Object> payload = new java.util.HashMap<>();
+            payload.put("transaction_id", txn.id);
+            payload.put("features", txn.mlFeatures);
+            String body = mapper.writeValueAsString(payload);
             SimpleHttpRequest req = SimpleRequestBuilder.post(ENDPOINT)
                 .setHeader("Content-Type", "application/json")
                 .setBody(body, ContentType.APPLICATION_JSON)
@@ -88,7 +91,8 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
                     try {
                         Map<?, ?> result = mapper.readValue(resp.getBodyText(), Map.class);
                         double prob = ((Number) result.get("fraud_probability")).doubleValue();
-                        if (prob >= PipelineConfig.ML_FRAUD_THRESHOLD) {
+                        boolean isFraud = (Boolean) result.get("is_fraud");
+                        if (isFraud) {
                             LOG.info("FRAUD_ALERT | ML001 | userId={} | prob={}",
                                 txn.userId, String.format("%.3f", prob));
                             future.complete(Collections.singletonList(FraudAlert.ml(txn, prob)));
