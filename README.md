@@ -14,27 +14,54 @@ Hệ thống phát hiện gian lận thẻ tín dụng theo **thời gian thực
 ## 📐 Kiến Trúc & Luồng Dữ Liệu
 
 ```mermaid
-flowchart TD
-    CSV["📁 creditcard.csv"] -->|1. Phát dữ liệu| REP["csv_replayer.py\n(host machine)"]
-    REP -->|"Port-Forward\nlocalhost:30093"| KAFKA[["Kafka\ntransactions"]]
-
-    subgraph k8s ["☸️ Kubernetes Cluster (Minikube)"]
-        KAFKA -->|2. Tiêu thụ| FLINK["Apache Flink\nJobManager + TaskManager"]
-        FLINK <-->|3. Async HTTP /predict| API["FastAPI ML Server\n& Dashboard Server :8001"]
-
-        API -->|4. Async Batch Write| CH_PRED[("ClickHouse\ndefault.model_predictions")]
-        FLINK -->|5. JDBC Write| CH_TXN[("ClickHouse\ndefault.transactions")]
-        FLINK -->|5. JDBC Write| CH_ALERT[("ClickHouse\ndefault.fraud_alerts")]
-        FLINK -->|6. Publish Alerts| KA_ALERT[["Kafka\nfraud-alerts"]]
-
-        API <-->|7. WebSocket /ws & Static| DASH["React Web Dashboard\n(Served tại /)"]
-        DASH -->|8. Hot-Swap Model| API
-
-        CH_TXN & CH_PRED -->|9. Join tính CM & metrics| API
-
-        PROM["Prometheus"] -->|Scrape metrics| FLINK & API
-        PROM -->|Query| GRAF["Grafana\n:30000"]
+flowchart LR
+    subgraph Host ["💻 Host Machine"]
+        CSV["📁 creditcard.csv"] -->|Replay| REP["scripts/csv_replayer.py"]
     end
+
+    subgraph Cluster ["☸️ Kubernetes Cluster (Minikube)"]
+        subgraph Broker ["Message Broker"]
+            K_TXN[["Kafka: transactions"]]
+            K_ALT[["Kafka: fraud-alerts"]]
+        end
+
+        subgraph Processing ["Stream Processing & Serving"]
+            FLINK["Apache Flink"]
+            API["FastAPI ML Server<br>(XGBoost Inference)"]
+        end
+
+        subgraph DB ["OLAP Database"]
+            CH[("ClickHouse<br>- transactions<br>- model_predictions<br>- ground_truth<br>- fraud_alerts")]
+        end
+
+        subgraph UI ["Observability & UI"]
+            DASH["React Dashboard"]
+            PROM["Prometheus"]
+            GRAF["Grafana"]
+        end
+    end
+
+    %% Data Ingestion Flow
+    REP -->|"Port-Forward: 30093"| K_TXN
+    K_TXN -->|Consume| FLINK
+    
+    %% Processing & Inference Flow
+    FLINK <-->|Async HTTP /predict| API
+    API -->|Async Batch Write| CH
+    
+    %% Sinks Flow
+    FLINK -->|JDBC Write| CH
+    FLINK -->|Publish Alerts| K_ALT
+
+    %% WebSocket & Dashboards Flow
+    CH -->|Query Metrics| DASH
+    API <-->|WebSocket CM| DASH
+    DASH -->|Hot-Swap Model| API
+    
+    %% Metrics Scrape
+    PROM -.->|Scrape| FLINK
+    PROM -.->|Scrape| API
+    PROM -->|Query| GRAF
 ```
 
 ### Luồng xử lý chi tiết
