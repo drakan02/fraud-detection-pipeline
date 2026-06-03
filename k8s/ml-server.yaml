@@ -31,10 +31,9 @@ kind: Service
 metadata:
   name: ml-server-service
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - port: 8001
       targetPort: 8001
-      nodePort: 30001
   selector:
     app: ml-server

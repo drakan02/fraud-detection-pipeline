@@ -91,15 +91,13 @@ kind: Service
 metadata:
   name: clickhouse-service
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - name: http
       port: 8123
       targetPort: 8123
-      nodePort: 30123
     - name: native
       port: 9000
       targetPort: 9000
-      nodePort: 30900
   selector:
     app: clickhouse

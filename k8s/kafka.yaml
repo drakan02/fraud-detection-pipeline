@@ -27,10 +27,9 @@ spec:
               value: "zookeeper-service:2181"
             - name: KAFKA_LISTENERS
               value: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093"
-            # EXTERNAL advertises minikube-ip:NodePort so csv_replayer on host
-            # connects directly via NodePort without needing port-forward.
+            # EXTERNAL advertises localhost:30093 since we connect via port-forward.
             - name: KAFKA_ADVERTISED_LISTENERS
-              value: "INTERNAL://kafka-service:9092,EXTERNAL://192.168.49.2:30093"
+              value: "INTERNAL://kafka-service:9092,EXTERNAL://localhost:30093"
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
               value: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
             - name: KAFKA_INTER_BROKER_LISTENER_NAME
@@ -47,7 +46,7 @@ kind: Service
 metadata:
   name: kafka-service
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - name: internal
       port: 9092
@@ -55,6 +54,5 @@ spec:
     - name: external
       port: 9093
       targetPort: 9093
-      nodePort: 30093
   selector:
     app: kafka

@@ -64,10 +64,9 @@ kind: Service
 metadata:
   name: prometheus
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - port: 9090
       targetPort: 9090
-      nodePort: 30090
   selector:
     app: prometheus
