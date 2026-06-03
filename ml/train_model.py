@@ -32,18 +32,28 @@ print("Loading dataset...")
 df = pd.read_csv(DATA)
 print(f"Shape: {df.shape} | Fraud rate: {df['Class'].mean():.4%}")
 
-# ── Step 2: Feature engineering (Robust Scaling due to outliers) ──────────────
+# ── Step 2: Stratified split ───────────────────────────────────────────────────
+df_train, df_test = train_test_split(
+    df, test_size=0.2, random_state=SEED, stratify=df["Class"])
+
+# ── Step 3: Feature engineering (Robust Scaling fitted on train only to avoid leakage) ──
 amount_scaler = RobustScaler()
 time_scaler   = RobustScaler()
-df["Amount_sc"] = amount_scaler.fit_transform(df[["Amount"]])
-df["Time_sc"]   = time_scaler.fit_transform(df[["Time"]])
+
+# Work on copies to avoid SettingWithCopyWarning
+df_train = df_train.copy()
+df_test = df_test.copy()
+
+df_train["Amount_sc"] = amount_scaler.fit_transform(df_train[["Amount"]])
+df_train["Time_sc"]   = time_scaler.fit_transform(df_train[["Time"]])
+
+df_test["Amount_sc"] = amount_scaler.transform(df_test[["Amount"]])
+df_test["Time_sc"]   = time_scaler.transform(df_test[["Time"]])
 
 FEATURES = [f"V{i}" for i in range(1, 29)] + ["Amount_sc", "Time_sc"]
-X, y = df[FEATURES], df["Class"]
-
-# ── Step 3: Stratified split ───────────────────────────────────────────────────
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=SEED, stratify=y)
+X_train, y_train = df_train[FEATURES], df_train["Class"]
+X_test, y_test = df_test[FEATURES], df_test["Class"]
+print(f"Train size: {len(X_train)} | Test size: {len(X_test)}")
 print(f"Train fraud: {y_train.sum()} | Test fraud: {y_test.sum()}")
 
 # ── Step 3.5: Remove extreme outliers from training set for top correlated features (V14, V12) ──

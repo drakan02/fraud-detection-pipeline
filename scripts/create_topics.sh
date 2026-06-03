@@ -3,7 +3,7 @@
 # Usage: ./scripts/create_topics.sh
 set -e
 
-for TOPIC in transactions fraud-rules fraud-alerts; do
+for TOPIC in transactions fraud-alerts; do
   kubectl exec deploy/kafka -- kafka-topics \
     --create --if-not-exists \
     --bootstrap-server localhost:9092 \

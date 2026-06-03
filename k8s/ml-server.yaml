@@ -30,9 +30,15 @@ spec:
             - name: CLICKHOUSE_PORT
               value: "8123"
             - name: CLICKHOUSE_USER
-              value: "default"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_USER
             - name: CLICKHOUSE_PASSWORD
-              value: "clickhousepass"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_PASSWORD
 ---
 apiVersion: v1
 kind: Service

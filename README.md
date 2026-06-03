@@ -227,7 +227,7 @@ chmod +x scripts/create_topics.sh
 ./scripts/create_topics.sh
 ```
 
-Script sẽ tạo: `transactions` (6 partitions), `fraud-rules` (6 partitions), `fraud-alerts` (6 partitions).
+Script sẽ tạo: `transactions` (6 partitions) và `fraud-alerts` (6 partitions).
 
 ---
 
@@ -389,7 +389,7 @@ curl -X POST http://localhost:30001/models/20260521_133240/activate
 curl -s http://localhost:30001/health
 ```
 
-> **Cơ chế:** `_load_version()` dùng atomic swap (`global _state = {...}`) — GIL của Python đảm bảo an toàn luồng, không cần lock.
+> **Cơ chế:** `_load_version()` sử dụng cơ chế ghi đè biến toàn cục kết hợp với `threading.RLock()` nhằm đảm bảo an toàn đa luồng tuyệt đối (thread-safe), tránh mọi tranh chấp tài nguyên (race conditions) giữa các yêu cầu dự đoán đồng thời và thao tác hot-swap.
 
 ---
 

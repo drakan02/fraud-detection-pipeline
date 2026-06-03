@@ -7,6 +7,7 @@ import com.fraud.model.Transaction;
 import com.fraud.serialization.FraudAlertSerializer;
 import com.fraud.serialization.TransactionDeserializer;
 import com.fraud.sink.AlertJdbcSink;
+import com.fraud.sink.GroundTruthJdbcSink;
 import com.fraud.sink.TransactionJdbcSink;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -34,7 +35,9 @@ public class FraudDetectionJob {
         env.setParallelism(PipelineConfig.PARALLELISM);
         env.enableCheckpointing(PipelineConfig.CHECKPOINT_INTERVAL,
             CheckpointingMode.EXACTLY_ONCE);
-        // Checkpoint storage — use file-based so state survives restarts
+        // Checkpoint storage backed by a PersistentVolumeClaim so state
+        // survives pod restarts and Flink can recover Kafka offsets + operator
+        // state automatically without replaying from the beginning.
         env.getCheckpointConfig().setCheckpointStorage(
             PipelineConfig.CHECKPOINT_STORAGE);
 
@@ -43,7 +46,8 @@ public class FraudDetectionJob {
             .setBootstrapServers(PipelineConfig.KAFKA_BOOTSTRAP)
             .setTopics(PipelineConfig.TRANSACTIONS_TOPIC)
             .setGroupId("fraud-detection-group")
-            .setStartingOffsets(OffsetsInitializer.committedOffsets(org.apache.kafka.clients.consumer.OffsetResetStrategy.EARLIEST))
+            .setStartingOffsets(OffsetsInitializer.committedOffsets(
+                org.apache.kafka.clients.consumer.OffsetResetStrategy.EARLIEST))
             .setDeserializer(new TransactionDeserializer())
             .build();
 
@@ -56,6 +60,8 @@ public class FraudDetectionJob {
             .fromSource(txnSource, watermark, "kafka-transaction-source");
 
         // ── Step 3: ML inference (async HTTP to FastAPI :8001) ─────────────
+        // MLInferenceFunction includes retry logic (3 attempts, exponential
+        // backoff) and a rule-based fallback when the ML server is unavailable.
         DataStream<FraudAlert> mlAlerts = AsyncDataStream.unorderedWait(
             transactions,
             new MLInferenceFunction(),
@@ -65,6 +71,7 @@ public class FraudDetectionJob {
         ).name("ml-inference");
 
         // ── Step 4: Sinks ─────────────────────────────────────────────────
+        // 4a. Kafka alert topic (for downstream consumers)
         KafkaSink<FraudAlert> kafkaAlertSink = KafkaSink.<FraudAlert>builder()
             .setBootstrapServers(PipelineConfig.KAFKA_BOOTSTRAP)
             .setRecordSerializer(new FraudAlertSerializer())
@@ -72,9 +79,17 @@ public class FraudDetectionJob {
             .build();
         mlAlerts.sinkTo(kafkaAlertSink).name("kafka-alert-sink");
 
+        // 4b. ClickHouse: fraud alerts
         mlAlerts.addSink(AlertJdbcSink.build()).name("clickhouse-alert-sink");
 
+        // 4c. ClickHouse: raw transaction business fields (no label/status column)
         transactions.addSink(TransactionJdbcSink.build()).name("clickhouse-txn-sink");
+
+        // 4d. ClickHouse: ground-truth labels written to a separate table.
+        //     In production this would come from a dispute-resolution pipeline.
+        //     Here we use the Kaggle dataset Class column (via Transaction.status)
+        //     to enable real-time Confusion Matrix evaluation in the dashboard.
+        transactions.addSink(GroundTruthJdbcSink.build()).name("clickhouse-ground-truth-sink");
 
         // ── Step 5: Execute ───────────────────────────────────────────────
         LOG.info("Submitting Fraud Detection Pipeline (ML only)...");

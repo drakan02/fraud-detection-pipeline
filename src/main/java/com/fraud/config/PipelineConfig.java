@@ -3,7 +3,7 @@ package com.fraud.config;
 public class PipelineConfig {
 
     // Kafka — host port 9093
-    public static final String KAFKA_BOOTSTRAP    = env("KAFKA_BOOTSTRAP",    "localhost:9093");
+    public static final String KAFKA_BOOTSTRAP    = env("KAFKA_BOOTSTRAP",    "localhost:30093");
     public static final String TRANSACTIONS_TOPIC = env("TRANSACTIONS_TOPIC", "transactions");
     public static final String ALERTS_TOPIC       = env("ALERTS_TOPIC",       "fraud-alerts");
 

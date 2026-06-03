@@ -4,30 +4,39 @@ Start: uvicorn ml.model_server:app --host 0.0.0.0 --port 8001
 
 Endpoints:
   GET  /health                      — liveness probe
-  POST /predict                     — fraud probability score
-  GET  /models                      — list all versioned models
-  POST /models/{version}/activate   — rollback to a previous version
+  POST /predict                     — fraud probability score + async ClickHouse write
+  GET  /models                      — list all versioned models from registry
+  POST /models/{version}/activate   — hot-swap to a specific model version
+  GET  /api/predictions             — recent predictions with ground-truth join
+  WS   /ws                          — real-time Confusion Matrix broadcast (2s interval)
   GET  /metrics                     — Prometheus scrape endpoint
 """
-import joblib
+import asyncio
 import json
 import os
-import numpy as np
+import queue
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from prometheus_fastapi_instrumentator import Instrumentator
-from prometheus_client import Counter, Gauge
-import queue
-import httpx
-import asyncio
 
-def load_env():
+import httpx
+import joblib
+import numpy as np
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from prometheus_client import Counter, Gauge
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel, Field
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# ── Environment -------------------------------------------------------------------
+def load_env() -> None:
+    """Load .env file into os.environ (non-overriding)."""
     env_path = Path(".env")
     if env_path.exists():
         for line in env_path.read_text().splitlines():
@@ -36,14 +45,16 @@ def load_env():
                 key, val = line.split("=", 1)
                 os.environ.setdefault(key.strip(), val.strip())
 
+
 load_env()
 
 MODEL_DIR = Path("ml/models")
 REGISTRY_PATH = MODEL_DIR / "model_registry.json"
 
-app = FastAPI(title="Fraud Detection Model Server", version="2.0")
+app = FastAPI(title="Fraud Detection Model Server", version="2.1")
 
-# ── Prometheus custom metrics ────────────────────────────────────────────────
+
+# ── Prometheus custom metrics -----------------------------------------------------
 fraud_predictions = Counter(
     "fraud_predictions_total",
     "Total predictions by fraud outcome",
@@ -57,35 +68,43 @@ model_info_gauge = Gauge(
 feature_drift_gauge = Gauge(
     "model_feature_drift_zscore",
     "Feature drift Z-score compared to training baseline (rolling window of 1000)",
-    ["feature"]
+    ["feature"],
 )
 prediction_mean_gauge = Gauge(
     "model_prediction_mean_probability",
-    "Rolling average predicted fraud probability (rolling window of 1000)"
+    "Rolling average predicted fraud probability (rolling window of 1000)",
 )
 
 # Instrument all FastAPI routes automatically (latency histogram, request count)
 Instrumentator().instrument(app).expose(app)
 
 
-# ── Model state (mutable for hot-swap) ───────────────────────────────────────
+# ── Model state (mutable for hot-swap) -------------------------------------------
+#   _state_lock protects all reads AND writes of _state to prevent race conditions
+#   between concurrent /predict calls (running in uvicorn's threadpool) and
+#   /models/{version}/activate calls that replace _state atomically.
+#   Using RLock (re-entrant) allows the same thread to acquire the lock multiple
+#   times without deadlock (e.g. startup calls _load_version which uses _state).
 _state: dict = {}
+_state_lock = threading.RLock()
+
 window_lock = threading.Lock()
-feature_window = deque(maxlen=1000)
-prediction_window = deque(maxlen=1000)
+feature_window: deque = deque(maxlen=1000)
+prediction_window: deque = deque(maxlen=1000)
 
 
 def _load_version(version: str) -> None:
-    """Load a specific versioned model into _state. version is timestamp string."""
-    suffix = f"_{version}" if version != "latest" else ""
+    """Load a specific versioned model into _state. `version` is a timestamp string."""
     if version == "latest":
-        model_path  = MODEL_DIR / "fraud_model.pkl"
+        model_path = MODEL_DIR / "fraud_model.pkl"
         scaler_path = MODEL_DIR / "amount_scaler.pkl"
-        time_path   = MODEL_DIR / "time_scaler.pkl"
+        time_path = MODEL_DIR / "time_scaler.pkl"
+        stats_path = MODEL_DIR / "baseline_stats.json"
     else:
-        model_path  = MODEL_DIR / f"fraud_model_{version}.pkl"
+        model_path = MODEL_DIR / f"fraud_model_{version}.pkl"
         scaler_path = MODEL_DIR / f"amount_scaler_{version}.pkl"
-        time_path   = MODEL_DIR / f"time_scaler_{version}.pkl"
+        time_path = MODEL_DIR / f"time_scaler_{version}.pkl"
+        stats_path = MODEL_DIR / f"baseline_stats_{version}.json"
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model version '{version}' not found at {model_path}")
@@ -94,33 +113,30 @@ def _load_version(version: str) -> None:
     loaded_amount = joblib.load(scaler_path)
     loaded_time = joblib.load(time_path)
 
-    global _state
-    stats_path = MODEL_DIR / f"baseline_stats_{version}.json" if version != "latest" else MODEL_DIR / "baseline_stats.json"
-    
-    baseline_mean = {}
-    baseline_std = {}
+    baseline_mean: dict = {}
+    baseline_std: dict = {}
     if stats_path.exists():
         try:
             stats = json.loads(stats_path.read_text())
             baseline_mean = stats.get("mean", {})
             baseline_std = stats.get("std", {})
-        except Exception as e:
-            print(f"Warning: failed to load baseline stats: {e}")
-            
+        except Exception as exc:
+            print(f"Warning: failed to load baseline stats: {exc}")
+
     features_list = [f"V{i}" for i in range(1, 29)] + ["Amount_sc", "Time_sc"]
     for feat in features_list:
         baseline_mean.setdefault(feat, 0.0)
         baseline_std.setdefault(feat, 1.0)
         if baseline_std[feat] <= 1e-6:
             baseline_std[feat] = 1.0
-            
-    _state = {
+
+    new_state = {
         "model": loaded_model,
         "amount_scaler": loaded_amount,
         "time_scaler": loaded_time,
         "version": version,
         "baseline_mean": baseline_mean,
-        "baseline_std": baseline_std
+        "baseline_std": baseline_std,
     }
 
     # Determine AUROC from registry
@@ -131,186 +147,298 @@ def _load_version(version: str) -> None:
             if entry.get("version") == version or version == "latest":
                 auroc = str(entry.get("auroc", "unknown"))
                 if version == "latest":
-                    # get last entry's auroc
                     auroc = str(registry[-1].get("auroc", "unknown"))
                 break
 
-    # Update Prometheus gauge
+    # Atomic swap: acquire lock, replace the entire _state dict reference.
+    global _state
+    with _state_lock:
+        _state = new_state
+
     model_info_gauge.labels(version=version, auroc=auroc).set(1)
+    print(f"Model version '{version}' loaded (AUROC={auroc})")
 
 
-# ── ClickHouse & Monitoring Client ────────────────────────────────────────────
+# ── ClickHouse async client -------------------------------------------------------
 CH_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
 CH_PORT = os.getenv("CLICKHOUSE_PORT", "30123")
 CH_USER = os.getenv("CLICKHOUSE_USER", "default")
 CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", "clickhousepass")
 CH_URL = f"http://{CH_HOST}:{CH_PORT}"
 
-def run_clickhouse_query(sql: str) -> dict:
-    r = httpx.post(
+# Shared async ClickHouse client for broadcast_loop and /api/predictions.
+# Sync fallback client used only for the ClickHouse writer thread.
+_async_ch_client: Optional[httpx.AsyncClient] = None
+
+
+async def async_ch_query(sql: str) -> dict:
+    """Run a ClickHouse query using the shared async HTTP client."""
+    assert _async_ch_client is not None, "Async ClickHouse client not initialised"
+    r = await _async_ch_client.post(
         CH_URL,
         params={"query": sql, "default_format": "JSON"},
         auth=(CH_USER, CH_PASS),
-        timeout=10.0
+        timeout=10.0,
     )
     if r.status_code != 200:
-        raise Exception(f"ClickHouse query failed: {r.text}")
+        raise RuntimeError(f"ClickHouse query failed: {r.text}")
     return r.json()
 
-def run_clickhouse_write(sql: str, data: str = None) -> None:
-    headers = {"Content-Type": "text/plain"}
-    r = httpx.post(
-        CH_URL,
-        params={"query": sql},
-        content=data,
-        auth=(CH_USER, CH_PASS),
-        headers=headers,
-        timeout=10.0
-    )
+
+def sync_ch_write(sql: str, data: str) -> None:
+    """Blocking ClickHouse INSERT — only called from the writer thread."""
+    with httpx.Client() as client:
+        r = client.post(
+            CH_URL,
+            params={"query": sql},
+            content=data,
+            auth=(CH_USER, CH_PASS),
+            headers={"Content-Type": "text/plain"},
+            timeout=10.0,
+        )
     if r.status_code != 200:
-        raise Exception(f"ClickHouse write failed: {r.text}")
+        raise RuntimeError(f"ClickHouse write failed: {r.text}")
 
-prediction_queue = queue.Queue()
 
-def clickhouse_writer_thread():
-    while True:
+# ── Prediction writer thread ------------------------------------------------------
+#   Drain the queue in batches and write to ClickHouse.
+#   Uses a threading.Event so the shutdown handler can request a graceful stop
+#   and wait for the queue to be fully drained before the process exits.
+
+prediction_queue: queue.Queue = queue.Queue()
+_writer_stop_event = threading.Event()
+
+
+def clickhouse_writer_thread() -> None:
+    """Background daemon that batches and writes predictions to ClickHouse."""
+    while not _writer_stop_event.is_set() or not prediction_queue.empty():
         try:
             item = prediction_queue.get(timeout=1.0)
-            batch = [item]
-            while not prediction_queue.empty() and len(batch) < 100:
-                try:
-                    batch.append(prediction_queue.get_nowait())
-                except queue.Empty:
-                    break
-            
-            lines = []
-            for item in batch:
-                lines.append(json.dumps({
-                    "transaction_id": item["transaction_id"],
-                    "model_version": item["model_version"],
-                    "probability": item["probability"],
-                    "prediction": int(item["prediction"])
-                }))
-            data = "\n".join(lines) + "\n"
-            
-            sql = "INSERT INTO default.model_predictions FORMAT JSONEachRow"
-            try:
-                run_clickhouse_write(sql, data)
-            except Exception as e:
-                print(f"Error writing batch to ClickHouse: {e}")
-                
-            for _ in range(len(batch)):
-                prediction_queue.task_done()
-                
         except queue.Empty:
             continue
-        except Exception as e:
-            print(f"Error in ClickHouse writer thread: {e}")
 
-active_connections = []
+        batch = [item]
+        while not prediction_queue.empty() and len(batch) < 100:
+            try:
+                batch.append(prediction_queue.get_nowait())
+            except queue.Empty:
+                break
 
-async def broadcast_loop():
+        lines = []
+        for rec in batch:
+            lines.append(
+                json.dumps(
+                    {
+                        "transaction_id": rec["transaction_id"],
+                        "model_version": rec["model_version"],
+                        "probability": rec["probability"],
+                        "prediction": int(rec["prediction"]),
+                        "shap_values": rec.get("shap_values", ""),
+                    }
+                )
+            )
+        data = "\n".join(lines) + "\n"
+        
+        # Write to ClickHouse with retries and DLQ fallback
+        max_retries = 5
+        backoff = 1.0
+        success = False
+        for attempt in range(max_retries):
+            try:
+                sync_ch_write("INSERT INTO default.model_predictions FORMAT JSONEachRow", data)
+                success = True
+                break
+            except Exception as exc:
+                print(f"[writer] ClickHouse batch write error (attempt {attempt+1}/{max_retries}): {exc}")
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2.0
+        
+        if not success:
+            try:
+                dlq_dir = Path("ml/dlq")
+                dlq_dir.mkdir(parents=True, exist_ok=True)
+                dlq_file = dlq_dir / f"predictions_dlq_{int(time.time())}.jsonl"
+                dlq_file.write_text(data)
+                print(f"[writer] Saved failed batch to DLQ file: {dlq_file}")
+            except Exception as dlq_exc:
+                print(f"[writer] Failed to write to DLQ file: {dlq_exc}")
+
+        for _ in range(len(batch)):
+            prediction_queue.task_done()
+
+
+# ── WebSocket broadcast loop ------------------------------------------------------
+#   Caches the last computed stats for 5 s to avoid hammering ClickHouse with
+#   heavy JOIN queries every 2 s for every active model version.
+
+active_connections: list = []
+_broadcast_cache: dict = {}       # version → stats dict
+_broadcast_cache_ts: float = 0.0  # epoch seconds when cache was last refreshed
+_CACHE_TTL_S: float = 5.0         # seconds before stats are recomputed
+
+
+async def broadcast_loop() -> None:
+    """Pushes updated Confusion Matrix stats to all connected WebSocket clients."""
+    global _broadcast_cache, _broadcast_cache_ts
     while True:
         await asyncio.sleep(2.0)
         if not active_connections:
             continue
         try:
-            sql_models = "SELECT DISTINCT model_version FROM default.model_predictions"
-            try:
-                res = await asyncio.to_thread(run_clickhouse_query, sql_models)
-                model_versions = [row["model_version"] for row in res.get("data", [])]
-            except Exception as e:
-                print(f"Error getting models: {e}")
-                model_versions = []
-                
+            now = time.monotonic()
             active_ver = _state.get("version", "latest")
-            if active_ver not in model_versions:
-                model_versions.append(active_ver)
-                
-            data = {"models": {}, "active_version": active_ver}
-            for version in model_versions:
-                if not version:
-                    continue
-                stats_sql = f"""
-                SELECT
-                    count() AS total,
-                    countIf(status = 'FRAUD' AND prediction = 1) AS tp,
-                    countIf(status = 'SUCCESS' AND prediction = 1) AS fp,
-                    countIf(status = 'SUCCESS' AND prediction = 0) AS tn,
-                    countIf(status = 'FRAUD' AND prediction = 0) AS fn
-                FROM (
-                    SELECT
-                        t.status AS status,
-                        p.prediction AS prediction
-                    FROM default.transactions AS t
-                    INNER JOIN default.model_predictions AS p ON t.id = p.transaction_id
-                    WHERE p.model_version = '{version}'
-                )
-                """
+
+            # Only re-query ClickHouse when cache is stale.
+            if now - _broadcast_cache_ts > _CACHE_TTL_S:
                 try:
-                    stats_res = await asyncio.to_thread(run_clickhouse_query, stats_sql)
-                    rows = stats_res.get("data", [])
-                    if rows and int(rows[0].get("total", 0)) > 0:
-                        row = rows[0]
-                        tp = int(row.get("tp", 0))
-                        fp = int(row.get("fp", 0))
-                        tn = int(row.get("tn", 0))
-                        fn = int(row.get("fn", 0))
-                        total = tp + fp + tn + fn
-                        
-                        accuracy = (tp + tn) / total if total > 0 else 0.0
-                        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-                        
-                        data["models"][version] = {
-                            "total": total,
-                            "accuracy": round(accuracy, 4),
-                            "precision": round(precision, 4),
-                            "recall": round(recall, 4),
-                            "f1": round(f1, 4),
-                            "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn}
-                        }
-                    else:
-                        data["models"][version] = {
-                            "total": 0,
-                            "accuracy": 0.0,
-                            "precision": 0.0,
-                            "recall": 0.0,
-                            "f1": 0.0,
-                            "confusion_matrix": {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
-                        }
-                except Exception as e:
-                    print(f"Error getting stats for version {version}: {e}")
-            
-            payload = json.dumps(data)
+                    res = await async_ch_query(
+                        "SELECT DISTINCT model_version FROM default.model_predictions"
+                    )
+                    model_versions = [row["model_version"] for row in res.get("data", [])]
+                except Exception as exc:
+                    print(f"[broadcast] Error listing model versions: {exc}")
+                    model_versions = []
+
+                if active_ver not in model_versions:
+                    model_versions.append(active_ver)
+
+                new_cache: dict = {}
+                for version in model_versions:
+                    if not version:
+                        continue
+                    # Join model_predictions against ground_truth (not transactions.status)
+                    # to correctly separate inference labels from ground truth labels.
+                    # Limited to the last 24 hours to prevent memory exhaustion and full-table scans.
+                    stats_sql = f"""
+                    SELECT
+                        count() AS total,
+                        countIf(gt.actual_label = 'FRAUD'   AND p.prediction = 1) AS tp,
+                        countIf(gt.actual_label = 'SUCCESS' AND p.prediction = 1) AS fp,
+                        countIf(gt.actual_label = 'SUCCESS' AND p.prediction = 0) AS tn,
+                        countIf(gt.actual_label = 'FRAUD'   AND p.prediction = 0) AS fn
+                    FROM default.model_predictions AS p
+                    INNER JOIN default.ground_truth AS gt
+                        ON p.transaction_id = gt.transaction_id
+                    WHERE p.model_version = '{version}'
+                      AND p.predicted_at >= now() - INTERVAL 24 HOUR
+                    """
+                    try:
+                        stats_res = await async_ch_query(stats_sql)
+                        rows = stats_res.get("data", [])
+                        if rows and int(rows[0].get("total", 0)) > 0:
+                            row = rows[0]
+                            tp = int(row.get("tp", 0))
+                            fp = int(row.get("fp", 0))
+                            tn = int(row.get("tn", 0))
+                            fn = int(row.get("fn", 0))
+                            total = tp + fp + tn + fn
+                            accuracy  = (tp + tn) / total if total > 0 else 0.0
+                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                            recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                            f1 = (2 * precision * recall / (precision + recall)
+                                  if (precision + recall) > 0 else 0.0)
+                            new_cache[version] = {
+                                "total": total,
+                                "accuracy":  round(accuracy, 4),
+                                "precision": round(precision, 4),
+                                "recall":    round(recall, 4),
+                                "f1":        round(f1, 4),
+                                "confusion_matrix": {
+                                    "tp": tp, "fp": fp, "tn": tn, "fn": fn
+                                },
+                            }
+                        else:
+                            new_cache[version] = {
+                                "total": 0, "accuracy": 0.0, "precision": 0.0,
+                                "recall": 0.0, "f1": 0.0,
+                                "confusion_matrix": {"tp": 0, "fp": 0, "tn": 0, "fn": 0},
+                            }
+                    except Exception as exc:
+                        print(f"[broadcast] Stats error for {version}: {exc}")
+
+                _broadcast_cache = new_cache
+                _broadcast_cache_ts = now
+
+            payload = json.dumps(
+                {"models": _broadcast_cache, "active_version": active_ver}
+            )
             for conn in list(active_connections):
                 try:
                     await conn.send_text(payload)
                 except Exception:
                     if conn in active_connections:
                         active_connections.remove(conn)
-        except Exception as e:
-            print(f"Error in broadcast loop: {e}")
 
+        except Exception as exc:
+            print(f"[broadcast] Unexpected error: {exc}")
+
+
+async def drift_monitoring_loop() -> None:
+    """Background task that periodically calculates feature drift and updates Prometheus."""
+    while True:
+        await asyncio.sleep(10.0)
+        try:
+            with window_lock:
+                if len(feature_window) < 10:
+                    continue
+                features_snapshot = list(feature_window)
+                predictions_snapshot = list(prediction_window)
+            
+            with _state_lock:
+                local_state = _state
+
+            if not local_state:
+                continue
+
+            arr = np.array(features_snapshot)
+            rolling_means = arr.mean(axis=0)
+            for key_feat, idx in [("V14", 13), ("V12", 11), ("V17", 16), ("Amount_sc", 28)]:
+                b_mean = local_state["baseline_mean"].get(key_feat, 0.0)
+                b_std  = local_state["baseline_std"].get(key_feat, 1.0)
+                drift_z = abs(rolling_means[idx] - b_mean) / b_std
+                feature_drift_gauge.labels(feature=key_feat).set(drift_z)
+            prediction_mean_gauge.set(float(np.mean(predictions_snapshot)))
+        except Exception as exc:
+            print(f"[drift] Error calculating drift: {exc}")
+
+
+# ── Startup / Shutdown -----------------------------------------------------------
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
+    global _async_ch_client
     _load_version("latest")
+    _async_ch_client = httpx.AsyncClient()
+    _writer_stop_event.clear()
     threading.Thread(target=clickhouse_writer_thread, daemon=True).start()
     asyncio.create_task(broadcast_loop())
+    asyncio.create_task(drift_monitoring_loop())
 
 
-# ── Schema ────────────────────────────────────────────────────────────────────
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    """Gracefully drain the prediction queue before process exits."""
+    print("[shutdown] Signalling writer thread to stop...")
+    _writer_stop_event.set()
+    # Block (in a thread) until the queue is fully drained.
+    await asyncio.to_thread(prediction_queue.join)
+    print("[shutdown] Prediction queue drained — writer thread stopped.")
+    if _async_ch_client:
+        await _async_ch_client.aclose()
+
+
+# ── Schema -----------------------------------------------------------------------
 FEATURE_NAMES = [f"V{i}" for i in range(1, 29)] + ["Amount", "Time"]
+SCALED_FEATURE_NAMES = [f"V{i}" for i in range(1, 29)] + ["Amount_sc", "Time_sc"]
 
 
 class TransactionFeatures(BaseModel):
-    V1:float;  V2:float;  V3:float;  V4:float;  V5:float
-    V6:float;  V7:float;  V8:float;  V9:float;  V10:float
-    V11:float; V12:float; V13:float; V14:float; V15:float
-    V16:float; V17:float; V18:float; V19:float; V20:float
-    V21:float; V22:float; V23:float; V24:float; V25:float
-    V26:float; V27:float; V28:float
+    V1:  float; V2:  float; V3:  float; V4:  float; V5:  float
+    V6:  float; V7:  float; V8:  float; V9:  float; V10: float
+    V11: float; V12: float; V13: float; V14: float; V15: float
+    V16: float; V17: float; V18: float; V19: float; V20: float
+    V21: float; V22: float; V23: float; V24: float; V25: float
+    V26: float; V27: float; V28: float
     Amount: float = Field(..., ge=0)
     Time:   float = Field(..., ge=0)
 
@@ -326,78 +454,80 @@ class PredictionResult(BaseModel):
     model_version: str
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+
+
+# ── Helper: build scaled feature array ------------------------------------------
+def _build_feature_array(f: TransactionFeatures, state: dict) -> np.ndarray:
+    """Scale Amount and Time, return (1, 30) numpy array ready for inference."""
+    raw = np.array([[getattr(f, feat) for feat in FEATURE_NAMES]])
+    raw[0, 28] = float(state["amount_scaler"].transform([[f.Amount]])[0][0])
+    raw[0, 29] = float(state["time_scaler"].transform([[f.Time]])[0][0])
+    return raw
+
+
+# ── Endpoints -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_loaded": bool(_state),
-        "model_version": _state.get("version", "unknown"),
-    }
+    with _state_lock:
+        ver = _state.get("version", "unknown")
+        loaded = bool(_state)
+    return {"status": "ok", "model_loaded": loaded, "model_version": ver}
 
 
 @app.post("/predict", response_model=PredictionResult)
 def predict(req: PredictRequest):
+    """Score a transaction and queue the result for ClickHouse logging."""
     try:
-        f = req.features
-        raw = np.array([[getattr(f, feat) for feat in FEATURE_NAMES]])
-        raw[0, 28] = float(_state["amount_scaler"].transform([[f.Amount]])[0][0])
-        raw[0, 29] = float(_state["time_scaler"].transform([[f.Time]])[0][0])
+        # Acquire lock once to get a consistent local reference to _state.
+        # The local reference remains valid even if hot-swap replaces _state
+        # mid-request, because Python's GC keeps the old dict alive.
+        with _state_lock:
+            local_state = _state
 
-        prob = float(_state["model"].predict_proba(raw)[0][1])
+        f = req.features
+        raw = _build_feature_array(f, local_state)
+        prob = float(local_state["model"].predict_proba(raw)[0][1])
         is_fraud = prob >= float(os.getenv("ML_THRESHOLD", "0.5"))
 
-        # Queue prediction for ClickHouse analytical logging
+        # Queue prediction for async ClickHouse write (SHAP removed)
         prediction_queue.put({
             "transaction_id": req.transaction_id,
-            "model_version": _state.get("version", "unknown"),
+            "model_version": local_state.get("version", "unknown"),
             "probability": prob,
-            "prediction": 1 if is_fraud else 0
+            "prediction": 1 if is_fraud else 0,
+            "shap_values": "",
         })
 
         fraud_predictions.labels(is_fraud=str(is_fraud).lower()).inc()
 
-        # Track features in the rolling window for drift monitoring
+        # Track rolling feature/prediction windows for drift monitoring
         feature_vector = raw[0].copy()
         with window_lock:
             feature_window.append(feature_vector)
             prediction_window.append(prob)
-            
-            # Compute rolling statistics if we have at least 10 sample predictions
-            if len(feature_window) >= 10:
-                arr = np.array(feature_window)
-                rolling_means = arr.mean(axis=0)
-                
-                # Expose drift for key features
-                # V14 -> index 13, V12 -> index 11, V17 -> index 16, Amount_sc -> index 28
-                for key_feat, idx in [("V14", 13), ("V12", 11), ("V17", 16), ("Amount_sc", 28)]:
-                    b_mean = _state["baseline_mean"].get(key_feat, 0.0)
-                    b_std = _state["baseline_std"].get(key_feat, 1.0)
-                    drift_z = abs(rolling_means[idx] - b_mean) / b_std
-                    feature_drift_gauge.labels(feature=key_feat).set(drift_z)
-                
-                # Expose rolling mean of fraud predictions
-                prediction_mean_gauge.set(float(np.mean(prediction_window)))
 
         return PredictionResult(
             fraud_probability=prob,
             is_fraud=is_fraud,
-            model_version=_state.get("version", "unknown"),
+            model_version=local_state.get("version", "unknown"),
         )
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+
 
 
 @app.get("/models")
 def list_models():
-    """List all versioned models with their AUROC from the registry."""
+    """List all versioned models with their metrics from the registry."""
     if not REGISTRY_PATH.exists():
         return {"active_version": _state.get("version"), "versions": []}
     registry = json.loads(REGISTRY_PATH.read_text())
-    return {
-        "active_version": _state.get("version"),
-        "versions": registry,
-    }
+    with _state_lock:
+        active = _state.get("version")
+    return {"active_version": active, "versions": registry}
 
 
 @app.post("/models/{version}/activate")
@@ -405,46 +535,56 @@ def activate_model(version: str):
     """Hot-swap to a specific model version without restarting the server."""
     import re
     if not re.match(r"^[a-zA-Z0-9_]+$", version):
-        raise HTTPException(status_code=400, detail="Invalid version format. Only alphanumeric characters and underscores are allowed.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid version format. Only alphanumeric characters and underscores are allowed.",
+        )
     try:
         _load_version(version)
         return {"status": "ok", "active_version": version}
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/predictions")
-def get_predictions(
+async def get_predictions(
     limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0)
+    offset: int = Query(default=0, ge=0),
 ):
+    """
+    Return recent predictions joined with ground_truth labels.
+    Ground truth is read from the dedicated `ground_truth` table rather than
+    `transactions.status` to maintain proper data separation.
+    """
     sql = f"""
     SELECT
-        p.transaction_id AS transaction_id,
-        p.model_version AS model_version,
-        p.probability AS probability,
-        p.prediction AS prediction,
-        t.status AS actual_status,
-        p.predicted_at AS predicted_at
+        p.transaction_id  AS transaction_id,
+        p.model_version   AS model_version,
+        p.probability     AS probability,
+        p.prediction      AS prediction,
+        gt.actual_label   AS actual_status,
+        p.predicted_at    AS predicted_at
     FROM default.model_predictions AS p
-    LEFT JOIN default.transactions AS t ON p.transaction_id = t.id
+    LEFT JOIN default.ground_truth AS gt
+        ON p.transaction_id = gt.transaction_id
     ORDER BY p.predicted_at DESC
     LIMIT {limit} OFFSET {offset}
     """
     try:
-        res = run_clickhouse_query(sql)
+        res = await async_ch_query(sql)
         rows = res.get("data", [])
         for row in rows:
             if "predicted_at" in row and row["predicted_at"] is not None:
                 row["predicted_at"] = str(row["predicted_at"])
         return {"data": rows, "limit": limit, "offset": offset}
-    except Exception as e:
-        print(f"Error fetching predictions: {e}")
-        return {"data": [], "limit": limit, "offset": offset, "error": str(e)}
+    except Exception as exc:
+        print(f"[api] Error fetching predictions: {exc}")
+        return {"data": [], "limit": limit, "offset": offset, "error": str(exc)}
 
 
+# ── WebSocket -------------------------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -459,23 +599,24 @@ async def websocket_endpoint(websocket: WebSocket):
             active_connections.remove(websocket)
 
 
+# ── Static files (React SPA) ----------------------------------------------------
 @app.get("/")
 def serve_ui():
-    import os
     if os.path.exists("ml/static/index.html"):
         return FileResponse("ml/static/index.html")
-    return {"message": "Welcome to Fraud Detection Model & Dashboard Server. (Dashboard UI not built yet)"}
+    return {
+        "message": "Welcome to Fraud Detection Model & Dashboard Server. "
+                   "(Dashboard UI not built yet — run: cd ml/dashboard && npm run build)"
+    }
 
 
 @app.get("/vite.svg")
 def serve_favicon():
-    import os
     if os.path.exists("ml/static/vite.svg"):
         return FileResponse("ml/static/vite.svg")
     raise HTTPException(status_code=404, detail="Favicon not found")
 
 
-import os
 os.makedirs("ml/static", exist_ok=True)
 if os.path.exists("ml/static/assets"):
     app.mount("/assets", StaticFiles(directory="ml/static/assets"), name="assets")

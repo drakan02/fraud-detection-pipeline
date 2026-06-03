@@ -10,34 +10,30 @@ import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import java.sql.Timestamp;
 
 /**
- * Writes raw transaction business fields to ClickHouse {@code default.transactions}.
+ * Writes ground-truth labels (actual_label = FRAUD | SUCCESS) to the
+ * {@code default.ground_truth} table in ClickHouse.
  *
- * <p>Note: The ground-truth label ({@code status}) is intentionally NOT stored here.
- * It is written to the separate {@code default.ground_truth} table by
- * {@link GroundTruthJdbcSink}, keeping business data and evaluation labels decoupled.</p>
+ * <p>In a production environment the ground-truth label only becomes
+ * available after a dispute-resolution process (chargebacks, manual review).
+ * Here we simulate that separation by writing the label to a dedicated table
+ * rather than embedding it in the {@code transactions} record, so the
+ * Confusion Matrix query can JOIN against {@code ground_truth} instead of
+ * reading a label that was co-located with the transaction features.</p>
  */
-public class TransactionJdbcSink {
+public class GroundTruthJdbcSink {
 
     private static final String SQL =
-        "INSERT INTO transactions " +
-        "(id, user_id, card_number, amount, currency, merchant_id, country, event_time) " +
-        "VALUES (?,?,?,?,?,?,?,?)";
+        "INSERT INTO ground_truth (transaction_id, actual_label) " +
+        "VALUES (?,?)";
 
     public static SinkFunction<Transaction> build() {
         return JdbcSink.sink(
             SQL,
             (stmt, t) -> {
                 stmt.setString(1, t.id);
-                stmt.setString(2, t.userId);
-                stmt.setString(3, t.cardNumber);
-                stmt.setBigDecimal(4, t.amount);
-                stmt.setString(5, t.currency);
-                stmt.setString(6, t.merchantId);
-                stmt.setString(7, t.country);
-                stmt.setTimestamp(8,
-                    t.eventTime != null
-                        ? Timestamp.from(t.eventTime)
-                        : new Timestamp(System.currentTimeMillis()));
+                // status is "FRAUD" or "SUCCESS" — set by csv_replayer from the
+                // Kaggle dataset Class column (ground truth label, demo-only)
+                stmt.setString(2, t.status != null ? t.status : "SUCCESS");
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(500)

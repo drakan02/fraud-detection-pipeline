@@ -23,7 +23,7 @@ public class FraudAlertSerializer
     public ProducerRecord<byte[], byte[]> serialize(
             FraudAlert alert, KafkaSinkContext ctx, Long timestamp) {
         try {
-            byte[] key   = alert.userId.getBytes();
+            byte[] key   = (alert.userId != null ? alert.userId : "unknown").getBytes();
             byte[] value = mapper.writeValueAsBytes(alert);
             return new ProducerRecord<>(PipelineConfig.ALERTS_TOPIC, key, value);
         } catch (Exception e) {

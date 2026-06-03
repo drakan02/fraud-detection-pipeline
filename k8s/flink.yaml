@@ -1,3 +1,11 @@
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PersistentVolume for Flink fat-JAR (host → container mount)
+# NOTE: `hostPath.path` must match the absolute path of the `target/` directory
+# on the Minikube host. If you clone the repo to a different location, update
+# this value accordingly. For a portable alternative, use `minikube mount` or
+# package the JAR inside the Flink image.
+# ─────────────────────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -11,6 +19,7 @@ spec:
   accessModes:
     - ReadWriteOnce
   hostPath:
+    # ⚠️  UPDATE THIS PATH if you clone the repo to a different directory.
     path: /home/khang/Code/data-pipeline/fraud-detection-pipeline/target
 ---
 apiVersion: v1
@@ -25,6 +34,22 @@ spec:
     requests:
       storage: 1Gi
   volumeName: flink-target-pv
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PersistentVolumeClaim for Flink checkpoints
+# Using a real PVC (not emptyDir!) so checkpoint state survives pod restarts
+# and Flink can recover Kafka offsets + operator state on failure.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flink-checkpoints-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -64,9 +89,15 @@ spec:
             - name: MODEL_SERVER_URL
               value: "http://ml-server-service:8001"
             - name: CLICKHOUSE_USER
-              value: "default"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_USER
             - name: CLICKHOUSE_PASSWORD
-              value: "clickhousepass"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_PASSWORD
             - name: FLINK_PROPERTIES
               value: |
                 jobmanager.rpc.address: flink-jobmanager-service
@@ -83,7 +114,8 @@ spec:
           persistentVolumeClaim:
             claimName: flink-target-pvc
         - name: checkpoints-volume
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: flink-checkpoints-pvc
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -121,9 +153,15 @@ spec:
             - name: MODEL_SERVER_URL
               value: "http://ml-server-service:8001"
             - name: CLICKHOUSE_USER
-              value: "default"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_USER
             - name: CLICKHOUSE_PASSWORD
-              value: "clickhousepass"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_PASSWORD
             - name: FLINK_PROPERTIES
               value: |
                 jobmanager.rpc.address: flink-jobmanager-service
@@ -141,7 +179,8 @@ spec:
           persistentVolumeClaim:
             claimName: flink-target-pvc
         - name: checkpoints-volume
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: flink-checkpoints-pvc
 ---
 apiVersion: v1
 kind: Service

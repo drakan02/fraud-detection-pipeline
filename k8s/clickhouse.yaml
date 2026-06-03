@@ -4,43 +4,81 @@ metadata:
   name: clickhouse-init-config
 data:
   01_schema.sql: |
+    -- ─────────────────────────────────────────────────────────────────────────
+    -- Table: transactions
+    --   Stores raw transaction business fields arriving from Flink JDBC sink.
+    --   ReplacingMergeTree(ingested_at) deduplicates on ORDER BY key (id),
+    --   keeping the row with the latest ingested_at on background merge.
+    -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.transactions (
-        id String,
-        user_id String,
-        card_number String,
-        amount Decimal(12, 2),
-        currency String,
-        merchant_id String,
-        country String,
-        status String,
-        event_time DateTime64(3),
-        ingested_at DateTime DEFAULT now()
-    ) ENGINE = ReplacingMergeTree()
+        id           String,
+        user_id      String,
+        card_number  String,
+        amount       Decimal(12, 2),
+        currency     String,
+        merchant_id  String,
+        country      String,
+        event_time   DateTime64(3),
+        ingested_at  DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(ingested_at)
+    PARTITION BY toYYYYMM(event_time)
     ORDER BY (event_time, id);
 
-    CREATE TABLE IF NOT EXISTS default.fraud_alerts (
-        id String,
-        transaction_id String,
-        user_id String,
-        pattern_id String,
-        pattern_name String,
-        severity String,
-        amount Float64,
-        description String,
-        source String,
-        ml_probability Float64,
-        detected_at DateTime64(3) DEFAULT now()
+    -- ─────────────────────────────────────────────────────────────────────────
+    -- Table: ground_truth
+    --   Stores the actual class label for each transaction separately from
+    --   the transaction record itself. This simulates the real-world pattern
+    --   where fraud labels arrive via a dispute-resolution process AFTER the
+    --   original transaction — not at inference time.
+    --   Used by the CM (Confusion Matrix) query instead of transactions.status.
+    -- ─────────────────────────────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS default.ground_truth (
+        transaction_id  String,
+        actual_label    String,        -- 'FRAUD' | 'SUCCESS'
+        created_at      DateTime64(3) DEFAULT now()
     ) ENGINE = ReplacingMergeTree()
+    PARTITION BY toYYYYMM(created_at)
+    ORDER BY transaction_id;
+
+    -- ─────────────────────────────────────────────────────────────────────────
+    -- Table: fraud_alerts
+    --   Append-only alert log; each alert has its own UUID so dedup is
+    --   meaningless — plain MergeTree is the correct engine here.
+    -- ─────────────────────────────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS default.fraud_alerts (
+        id              String,
+        transaction_id  String,
+        user_id         String,
+        pattern_id      String,
+        pattern_name    String,
+        severity        String,
+        amount          Float64,
+        description     String,
+        source          String,
+        ml_probability  Float64,
+        detected_at     DateTime64(3) DEFAULT now()
+    ) ENGINE = MergeTree()
+    PARTITION BY toYYYYMM(detected_at)
     ORDER BY (detected_at, id);
 
+    -- ─────────────────────────────────────────────────────────────────────────
+    -- Table: model_predictions
+    --   One row per (transaction, model_version) pair.
+    --   ORDER BY (transaction_id, model_version) so ReplacingMergeTree can
+    --   dedup retried predictions correctly.
+    --   shap_values (Deprecated) - kept for schema backward compatibility but no longer used.
+    -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.model_predictions (
-        transaction_id String,
-        model_version String,
-        probability Float64,
-        prediction UInt8,
-        predicted_at DateTime64(3) DEFAULT now()
+        transaction_id  String,
+        model_version   String,
+        probability     Float64,
+        prediction      UInt8,
+        shap_values     String DEFAULT '',   -- Deprecated
+        predicted_at    DateTime64(3) DEFAULT now(),
+        INDEX idx_predicted_at predicted_at TYPE minmax GRANULARITY 1
     ) ENGINE = ReplacingMergeTree()
-    ORDER BY (predicted_at, transaction_id);
+    PARTITION BY toYYYYMM(predicted_at)
+    ORDER BY (transaction_id, model_version);
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -51,7 +89,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,9 +117,15 @@ spec:
               name: native
           env:
             - name: CLICKHOUSE_USER
-              value: "default"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_USER
             - name: CLICKHOUSE_PASSWORD
-              value: "clickhousepass"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: CLICKHOUSE_PASSWORD
           volumeMounts:
             - name: clickhouse-data
               mountPath: /var/lib/clickhouse

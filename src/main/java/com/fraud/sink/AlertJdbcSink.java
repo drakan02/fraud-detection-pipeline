@@ -36,6 +36,7 @@ public class AlertJdbcSink {
             JdbcExecutionOptions.builder()
                 .withBatchSize(200)
                 .withBatchIntervalMs(1000)
+                .withMaxRetries(3)
                 .build(),
             new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
                 .withUrl(PipelineConfig.CLICKHOUSE_URL)
