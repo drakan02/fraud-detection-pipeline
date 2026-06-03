@@ -14,7 +14,7 @@ public class PipelineConfig {
     public static final String PG_PASSWORD = env("PG_PASSWORD", "fraudpass");
 
     // FastAPI model server — port 8001
-    public static final String MODEL_SERVER_URL   = env("MODEL_SERVER_URL",   "http://localhost:8001");
+    public static final String MODEL_SERVER_URL   = env("MODEL_SERVER_URL", "http://localhost:" + env("MODEL_SERVER_PORT", "8001"));
     public static final double ML_FRAUD_THRESHOLD = Double.parseDouble(env("ML_THRESHOLD", "0.5"));
 
     // Flink
@@ -22,6 +22,7 @@ public class PipelineConfig {
     public static final int CHECKPOINT_INTERVAL  = Integer.parseInt(env("CHECKPOINT_INTERVAL",  "30000"));
     public static final int ML_ASYNC_TIMEOUT_MS  = Integer.parseInt(env("ML_ASYNC_TIMEOUT_MS",  "5000"));
     public static final int ML_ASYNC_CAPACITY    = Integer.parseInt(env("ML_ASYNC_CAPACITY",    "100"));
+    public static final String CHECKPOINT_STORAGE = env("CHECKPOINT_STORAGE", "file:///tmp/flink-checkpoints/fraud-pipeline");
 
     private static String env(String key, String defaultVal) {
         String v = System.getenv(key);

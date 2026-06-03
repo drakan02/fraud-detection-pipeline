@@ -17,7 +17,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import roc_auc_score, classification_report, average_precision_score
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
@@ -32,9 +32,9 @@ print("Loading dataset...")
 df = pd.read_csv(DATA)
 print(f"Shape: {df.shape} | Fraud rate: {df['Class'].mean():.4%}")
 
-# ── Step 2: Feature engineering ───────────────────────────────────────────────
-amount_scaler = StandardScaler()
-time_scaler   = StandardScaler()
+# ── Step 2: Feature engineering (Robust Scaling due to outliers) ──────────────
+amount_scaler = RobustScaler()
+time_scaler   = RobustScaler()
 df["Amount_sc"] = amount_scaler.fit_transform(df[["Amount"]])
 df["Time_sc"]   = time_scaler.fit_transform(df[["Time"]])
 
@@ -46,6 +46,26 @@ X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=SEED, stratify=y)
 print(f"Train fraud: {y_train.sum()} | Test fraud: {y_test.sum()}")
 
+# ── Step 3.5: Remove extreme outliers from training set for top correlated features (V14, V12) ──
+def remove_outliers(X_df, y_df, features_list, threshold=1.5):
+    df_temp = pd.concat([X_df, y_df], axis=1)
+    initial_len = len(df_temp)
+    for feat in features_list:
+        fraud_data = df_temp[df_temp['Class'] == 1][feat]
+        q25, q75 = np.percentile(fraud_data, 25), np.percentile(fraud_data, 75)
+        iqr = q75 - q25
+        cut_off = iqr * threshold
+        lower, upper = q25 - cut_off, q75 + cut_off
+        
+        # Remove extreme outliers of the fraud class to prevent overfitting
+        outliers_mask = (df_temp['Class'] == 1) & ((df_temp[feat] < lower) | (df_temp[feat] > upper))
+        df_temp = df_temp[~outliers_mask]
+    
+    print(f"Outlier removal ({features_list}): dropped {initial_len - len(df_temp)} rows.")
+    return df_temp.drop('Class', axis=1), df_temp['Class']
+
+X_train, y_train = remove_outliers(X_train, y_train, ['V14', 'V12'])
+
 # ── Step 4: SMOTE on training set only ────────────────────────────────────────
 print("Applying SMOTE...")
 X_res, y_res = SMOTE(random_state=SEED, sampling_strategy=0.1).fit_resample(X_train, y_train)
@@ -53,9 +73,11 @@ print(f"After SMOTE: {X_res.shape} | Fraud: {y_res.sum()}")
 
 # ── Step 5: Train XGBoost ─────────────────────────────────────────────────────
 print("Training...")
+ratio = float(y_res.value_counts()[0] / y_res.value_counts()[1])
 model = XGBClassifier(
     n_estimators=300, max_depth=6, learning_rate=0.05,
     subsample=0.8, colsample_bytree=0.8,
+    scale_pos_weight=ratio,
     eval_metric="aucpr", random_state=SEED, n_jobs=-1,
 )
 model.fit(X_res, y_res, eval_set=[(X_test, y_test)], verbose=100)

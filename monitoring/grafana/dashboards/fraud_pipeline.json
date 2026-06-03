@@ -15,15 +15,15 @@
       "id": 1,
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "type": "stat",
-      "title": "Fraud Alerts (Total)",
+      "title": "Total Fraud Alerts",
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "center", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": {
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }, "unit": "short" },
         "overrides": []
       },
       "targets": [{
-        "expr": "sum(increase(fraud_predictions_total{is_fraud=\"true\"}[5m]))",
-        "legendFormat": "Fraud Alerts (5m)",
+        "expr": "sum(fraud_predictions_total{is_fraud=\"true\"})",
+        "legendFormat": "Fraud Alerts",
         "datasource": "Prometheus"
       }]
     },
@@ -37,7 +37,8 @@
         "defaults": {
           "color": { "mode": "thresholds" },
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 }] },
-          "unit": "percent"
+          "unit": "percent",
+          "decimals": 3
         },
         "overrides": []
       },
@@ -82,7 +83,7 @@
         "overrides": []
       },
       "targets": [{
-        "expr": "sum(increase(fraud_pipeline_malformed_messages_total[5m]))",
+        "expr": "sum(increase({__name__=~\".*fraud_pipeline_malformed_messages_total\"}[5m]))",
         "legendFormat": "Malformed (5m)",
         "datasource": "Prometheus"
       }]
@@ -100,6 +101,22 @@
       "targets": [{
         "expr": "fraud_model_info",
         "legendFormat": "{{version}}",
+        "datasource": "Prometheus"
+      }]
+    },
+    {
+      "id": 10,
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "type": "stat",
+      "title": "Total Transactions",
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "center", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" }, "unit": "short" },
+        "overrides": []
+      },
+      "targets": [{
+        "expr": "sum(fraud_predictions_total)",
+        "legendFormat": "Total Transactions",
         "datasource": "Prometheus"
       }]
     },
@@ -168,12 +185,12 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
       "targets": [
         {
-          "expr": "sum(rate(fraud_pipeline_valid_messages_total[1m]))",
+          "expr": "sum(rate({__name__=~\".*fraud_pipeline_valid_messages_total\"}[1m]))",
           "legendFormat": "Valid/s",
           "datasource": "Prometheus"
         },
         {
-          "expr": "sum(rate(fraud_pipeline_malformed_messages_total[1m]))",
+          "expr": "sum(rate({__name__=~\".*fraud_pipeline_malformed_messages_total\"}[1m]))",
           "legendFormat": "Malformed/s",
           "datasource": "Prometheus"
         }
@@ -191,12 +208,12 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{handler=\"/predict\", status_code=~\"2..\"}[1m]))",
+          "expr": "sum(rate(http_requests_total{handler=\"/predict\", status=\"2xx\"}[1m]))",
           "legendFormat": "Success/s",
           "datasource": "Prometheus"
         },
         {
-          "expr": "sum(rate(http_requests_total{handler=\"/predict\", status_code=~\"5..\"}[1m]))",
+          "expr": "sum(rate(http_requests_total{handler=\"/predict\", status=\"5xx\"}[1m]))",
           "legendFormat": "Errors/s",
           "datasource": "Prometheus"
         }

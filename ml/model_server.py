@@ -20,6 +20,17 @@ from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Gauge
 
+def load_env():
+    env_path = Path(".env")
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+
+load_env()
+
 MODEL_DIR = Path("ml/models")
 REGISTRY_PATH = MODEL_DIR / "model_registry.json"
 
@@ -60,10 +71,17 @@ def _load_version(version: str) -> None:
     if not model_path.exists():
         raise FileNotFoundError(f"Model version '{version}' not found at {model_path}")
 
-    _state["model"]          = joblib.load(model_path)
-    _state["amount_scaler"]  = joblib.load(scaler_path)
-    _state["time_scaler"]    = joblib.load(time_path)
-    _state["version"]        = version
+    loaded_model = joblib.load(model_path)
+    loaded_amount = joblib.load(scaler_path)
+    loaded_time = joblib.load(time_path)
+
+    global _state
+    _state = {
+        "model": loaded_model,
+        "amount_scaler": loaded_amount,
+        "time_scaler": loaded_time,
+        "version": version
+    }
 
     # Determine AUROC from registry
     auroc = "unknown"
@@ -160,3 +178,9 @@ def activate_model(version: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("MODEL_SERVER_PORT", "8001"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

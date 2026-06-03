@@ -8,16 +8,29 @@ Usage:
   python scripts/csv_replayer.py --fraud-only        # fraud rows only
   python scripts/csv_replayer.py --speed 50 --limit 2000
 """
-import argparse, json, time, uuid
+import argparse, json, time, uuid, os
 from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 from kafka import KafkaProducer
 
-KAFKA    = "localhost:9093"
-TOPIC    = "transactions"
-DATA     = Path("ml/data/creditcard.csv")
-COUNTRIES = ["VN","US","SG","JP","GB","DE","FR","AU","TH","MY"]
+# Load .env file manually to read ports if they are not in environment
+def load_env():
+    env_path = Path(".env")
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+
+load_env()
+
+KAFKA_PORT = os.getenv("KAFKA_PORT", "9093")
+KAFKA      = os.getenv("KAFKA_BOOTSTRAP", f"localhost:{KAFKA_PORT}")
+TOPIC      = os.getenv("TRANSACTIONS_TOPIC", "transactions")
+DATA       = Path("ml/data/creditcard.csv")
+COUNTRIES  = ["VN","US","SG","JP","GB","DE","FR","AU","TH","MY"]
 
 
 def args():

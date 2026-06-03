@@ -12,8 +12,13 @@ import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.client5.http.async.methods.SimpleRequestBuilder;
 import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.util.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,10 +35,30 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        httpClient = HttpAsyncClients.createDefault();
+        ConnectionConfig connectionConfig = ConnectionConfig.custom()
+            .setConnectTimeout(Timeout.ofSeconds(4))
+            .setSocketTimeout(Timeout.ofSeconds(4))
+            .build();
+
+        RequestConfig requestConfig = RequestConfig.custom()
+            .setConnectionRequestTimeout(Timeout.ofSeconds(4))
+            .setResponseTimeout(Timeout.ofSeconds(4))
+            .build();
+
+        PoolingAsyncClientConnectionManager connManager = PoolingAsyncClientConnectionManagerBuilder.create()
+            .setMaxConnPerRoute(PipelineConfig.ML_ASYNC_CAPACITY)
+            .setMaxConnTotal(PipelineConfig.ML_ASYNC_CAPACITY * 2)
+            .setDefaultConnectionConfig(connectionConfig)
+            .build();
+
+        httpClient = HttpAsyncClients.custom()
+            .setConnectionManager(connManager)
+            .setDefaultRequestConfig(requestConfig)
+            .build();
         httpClient.start();
         mapper = new ObjectMapper();
-        LOG.info("MLInferenceFunction ready — endpoint: {}", ENDPOINT);
+        LOG.info("MLInferenceFunction ready — endpoint: {} (connection pool configured: max per route {}, max total {})",
+            ENDPOINT, PipelineConfig.ML_ASYNC_CAPACITY, PipelineConfig.ML_ASYNC_CAPACITY * 2);
     }
 
     @Override
