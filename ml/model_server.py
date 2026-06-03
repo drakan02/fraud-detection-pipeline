@@ -13,6 +13,8 @@ import joblib
 import json
 import os
 import numpy as np
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException
@@ -47,6 +49,15 @@ model_info_gauge = Gauge(
     "Active model metadata (always=1, labels carry version info)",
     ["version", "auroc"],
 )
+feature_drift_gauge = Gauge(
+    "model_feature_drift_zscore",
+    "Feature drift Z-score compared to training baseline (rolling window of 1000)",
+    ["feature"]
+)
+prediction_mean_gauge = Gauge(
+    "model_prediction_mean_probability",
+    "Rolling average predicted fraud probability (rolling window of 1000)"
+)
 
 # Instrument all FastAPI routes automatically (latency histogram, request count)
 Instrumentator().instrument(app).expose(app)
@@ -54,6 +65,9 @@ Instrumentator().instrument(app).expose(app)
 
 # ── Model state (mutable for hot-swap) ───────────────────────────────────────
 _state: dict = {}
+window_lock = threading.Lock()
+feature_window = deque(maxlen=1000)
+prediction_window = deque(maxlen=1000)
 
 
 def _load_version(version: str) -> None:
@@ -76,11 +90,32 @@ def _load_version(version: str) -> None:
     loaded_time = joblib.load(time_path)
 
     global _state
+    stats_path = MODEL_DIR / f"baseline_stats_{version}.json" if version != "latest" else MODEL_DIR / "baseline_stats.json"
+    
+    baseline_mean = {}
+    baseline_std = {}
+    if stats_path.exists():
+        try:
+            stats = json.loads(stats_path.read_text())
+            baseline_mean = stats.get("mean", {})
+            baseline_std = stats.get("std", {})
+        except Exception as e:
+            print(f"Warning: failed to load baseline stats: {e}")
+            
+    features_list = [f"V{i}" for i in range(1, 29)] + ["Amount_sc", "Time_sc"]
+    for feat in features_list:
+        baseline_mean.setdefault(feat, 0.0)
+        baseline_std.setdefault(feat, 1.0)
+        if baseline_std[feat] <= 1e-6:
+            baseline_std[feat] = 1.0
+            
     _state = {
         "model": loaded_model,
         "amount_scaler": loaded_amount,
         "time_scaler": loaded_time,
-        "version": version
+        "version": version,
+        "baseline_mean": baseline_mean,
+        "baseline_std": baseline_std
     }
 
     # Determine AUROC from registry
@@ -146,6 +181,28 @@ def predict(f: TransactionFeatures):
         is_fraud = prob >= float(os.getenv("ML_THRESHOLD", "0.5"))
 
         fraud_predictions.labels(is_fraud=str(is_fraud).lower()).inc()
+
+        # Track features in the rolling window for drift monitoring
+        feature_vector = raw[0].copy()
+        with window_lock:
+            feature_window.append(feature_vector)
+            prediction_window.append(prob)
+            
+            # Compute rolling statistics if we have at least 10 sample predictions
+            if len(feature_window) >= 10:
+                arr = np.array(feature_window)
+                rolling_means = arr.mean(axis=0)
+                
+                # Expose drift for key features
+                # V14 -> index 13, V12 -> index 11, V17 -> index 16, Amount_sc -> index 28
+                for key_feat, idx in [("V14", 13), ("V12", 11), ("V17", 16), ("Amount_sc", 28)]:
+                    b_mean = _state["baseline_mean"].get(key_feat, 0.0)
+                    b_std = _state["baseline_std"].get(key_feat, 1.0)
+                    drift_z = abs(rolling_means[idx] - b_mean) / b_std
+                    feature_drift_gauge.labels(feature=key_feat).set(drift_z)
+                
+                # Expose rolling mean of fraud predictions
+                prediction_mean_gauge.set(float(np.mean(prediction_window)))
 
         return PredictionResult(
             fraud_probability=prob,

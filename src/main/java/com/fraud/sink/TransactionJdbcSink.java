@@ -14,8 +14,7 @@ public class TransactionJdbcSink {
     private static final String SQL =
         "INSERT INTO transactions " +
         "(id,user_id,card_number,amount,currency,merchant_id,country,status,event_time) " +
-        "VALUES (?,?,?,?,?,?,?,?,?) " +
-        "ON CONFLICT (id) DO NOTHING";
+        "VALUES (?,?,?,?,?,?,?,?,?)";
 
     public static SinkFunction<Transaction> build() {
         return JdbcSink.sink(
@@ -36,10 +35,10 @@ public class TransactionJdbcSink {
                 .withBatchIntervalMs(1000)
                 .build(),
             new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-                .withUrl(PipelineConfig.PG_URL)
-                .withDriverName("org.postgresql.Driver")
-                .withUsername(PipelineConfig.PG_USER)
-                .withPassword(PipelineConfig.PG_PASSWORD)
+                .withUrl(PipelineConfig.CLICKHOUSE_URL)
+                .withDriverName("com.clickhouse.jdbc.ClickHouseDriver")
+                .withUsername(PipelineConfig.CLICKHOUSE_USER)
+                .withPassword(PipelineConfig.CLICKHOUSE_PASSWORD)
                 .build()
         );
     }

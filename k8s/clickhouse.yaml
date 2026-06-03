@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-init-config
+data:
+  01_schema.sql: |
+    CREATE TABLE IF NOT EXISTS default.transactions (
+        id String,
+        user_id String,
+        card_number String,
+        amount Decimal(12, 2),
+        currency String,
+        merchant_id String,
+        country String,
+        status String,
+        event_time DateTime64(3),
+        ingested_at DateTime DEFAULT now()
+    ) ENGINE = MergeTree()
+    ORDER BY (event_time, user_id, id);
+
+    CREATE TABLE IF NOT EXISTS default.fraud_alerts (
+        id String,
+        transaction_id String,
+        user_id String,
+        pattern_id String,
+        pattern_name String,
+        severity String,
+        amount Float64,
+        description String,
+        source String,
+        ml_probability Float64,
+        detected_at DateTime64(3) DEFAULT now()
+    ) ENGINE = MergeTree()
+    ORDER BY (detected_at, user_id, id);
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  labels:
+    app: clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.3-alpine
+          ports:
+            - containerPort: 8123
+              name: http
+            - containerPort: 9000
+              name: native
+          env:
+            - name: CLICKHOUSE_USER
+              value: "default"
+            - name: CLICKHOUSE_PASSWORD
+              value: "clickhousepass"
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+            - name: clickhouse-init
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: clickhouse-data
+          persistentVolumeClaim:
+            claimName: clickhouse-pvc
+        - name: clickhouse-init
+          configMap:
+            name: clickhouse-init-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-service
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+      nodePort: 30123
+    - name: native
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900
+  selector:
+    app: clickhouse

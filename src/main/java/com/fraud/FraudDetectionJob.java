@@ -64,7 +64,7 @@ public class FraudDetectionJob {
             PipelineConfig.ML_ASYNC_CAPACITY
         ).name("ml-inference");
 
-        // ── Step 4: Merge all alert streams ───────────────────────────────
+        // ── Step 4: (Reserved for future CEP/rule-based streams) ────────
         DataStream<FraudAlert> allAlerts = mlAlerts;
 
         // ── Step 5: Sinks ─────────────────────────────────────────────────
@@ -76,12 +76,11 @@ public class FraudDetectionJob {
             .build();
         allAlerts.sinkTo(kafkaAlertSink).name("kafka-alert-sink");
 
-        // PostgreSQL alerts sink
-        allAlerts.addSink(AlertJdbcSink.build()).name("postgres-alert-sink");
+        // ClickHouse alerts sink
+        allAlerts.addSink(AlertJdbcSink.build()).name("clickhouse-alert-sink");
 
-        // PostgreSQL transactions sink — write directly from source stream
-        // (previous version incorrectly used a side output that was never emitted)
-        transactions.addSink(TransactionJdbcSink.build()).name("postgres-txn-sink");
+        // ClickHouse transactions sink — write every ingested transaction for analytics
+        transactions.addSink(TransactionJdbcSink.build()).name("clickhouse-txn-sink");
 
         // ── Step 6: Execute ───────────────────────────────────────────────
         LOG.info("Submitting Fraud Detection Pipeline (ML only)...");

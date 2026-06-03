@@ -1,3 +1,10 @@
+# NOTE: This file is a LOCAL REFERENCE only.
+# The actual Prometheus configuration used in Kubernetes is embedded
+# inside k8s/prometheus.yaml (as a ConfigMap).
+#
+# This file is kept for documentation/development purposes only
+# and is NOT mounted into any container.
+
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -5,13 +12,13 @@ global:
 scrape_configs:
   - job_name: "fastapi-model-server"
     static_configs:
-      - targets: ["host.docker.internal:8001"]
+      - targets: ["ml-server-service:8001"]
     metrics_path: /metrics
 
   - job_name: "flink-taskmanager"
     static_configs:
-      - targets: ["host.docker.internal:9249"]
+      - targets: ["flink-taskmanager-service:9249"]
 
   - job_name: "flink-jobmanager"
     static_configs:
-      - targets: ["host.docker.internal:9250"]
+      - targets: ["flink-jobmanager-service:9249"]

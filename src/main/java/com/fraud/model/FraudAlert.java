@@ -12,28 +12,11 @@ public class FraudAlert {
     public String severity;
     public double amount;
     public String description;
-    public String source;           // "CEP" | "ML"
-    public double mlProbability;    // 0.0 for CEP alerts
+    public String source;           // "ML" (reserved: "CEP" for future rule-based detection)
+    public double mlProbability;
     public Instant detectedAt;
 
     public FraudAlert() {}
-
-    public static FraudAlert cep(Transaction txn, String patternId,
-                                  String patternName, String severity, String description) {
-        FraudAlert a = new FraudAlert();
-        a.id = UUID.randomUUID().toString();
-        a.transactionId = txn.id;
-        a.userId = txn.userId;
-        a.patternId = patternId;
-        a.patternName = patternName;
-        a.severity = severity;
-        a.amount = txn.amount.doubleValue();
-        a.description = description;
-        a.source = "CEP";
-        a.mlProbability = 0.0;
-        a.detectedAt = Instant.now();
-        return a;
-    }
 
     public static FraudAlert ml(Transaction txn, double probability) {
         FraudAlert a = new FraudAlert();

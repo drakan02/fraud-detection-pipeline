@@ -19,6 +19,8 @@ venv/
 env/
 ml/data/
 ml/models/*.pkl
+ml/models/baseline_stats*.json
+ml/models/model_registry.json
 *.egg-info/
 .pytest_cache/
 
@@ -46,5 +48,4 @@ Thumbs.db
 # =========================
 *.log
 .agents/
-ml/models/model_registry.json
 scratch/

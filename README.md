@@ -1,252 +1,460 @@
-# 🛡️ Hệ Thống Phát Hiện Gian Lận Theo Thời Gian Thực v1.0 (Real-Time Fraud Detection Pipeline)
+# 🛡️ Real-Time Fraud Detection Pipeline
 
-Một hệ thống dữ liệu (data pipeline) hoàn chỉnh, sẵn sàng cho môi trường production dùng để phát hiện gian lận thẻ tín dụng theo thời gian thực. Dự án này sử dụng sức mạnh xử lý luồng của **Apache Flink** kết hợp bất đồng bộ với Engine học máy **Machine Learning** (XGBoost) được triển khai qua FastAPI. Hệ thống đi kèm với tính năng giám sát toàn diện thông qua **Prometheus & Grafana**, khả năng thay thế mô hình ML linh hoạt (Hot-swapping / Model Versioning) mà không cần thời gian downtime (zero-downtime).
+Hệ thống phát hiện gian lận thẻ tín dụng theo **thời gian thực**, được xây dựng trên nền tảng **Apache Flink** xử lý luồng kết hợp bất đồng bộ với mô hình **XGBoost** thông qua FastAPI, toàn bộ hạ tầng chạy trên **Kubernetes (Minikube)**.
+
+Điểm nổi bật:
+- 🔁 **Async ML Inference** — Flink gọi bất đồng bộ sang FastAPI, không chặn luồng xử lý chính
+- 📦 **ClickHouse** — OLAP storage cho analytics giao dịch và cảnh báo fraud
+- 🔄 **Hot-swap model** — Thay mô hình ML không downtime qua HTTP API
+- 📊 **Observability** — Prometheus + Grafana với drift detection tự động
+- ☸️ **Kubernetes-native** — Toàn bộ hạ tầng chạy trong Minikube, truy cập qua NodePort
 
 ---
 
-## 🏗️ Kiến trúc & Luồng dữ liệu (Data Flow)
-
-Hệ thống hoạt động dựa trên mô hình học máy thông minh giúp phát hiện các mẫu gian lận tinh vi với độ trễ cực thấp:
+## 📐 Kiến Trúc & Luồng Dữ Liệu
 
 ```mermaid
 flowchart LR
-    CSV["📁 creditcard.csv"] --> REP["csv_replayer.py"]
-    REP --> KAFKA_TXN[["Kafka\ntransactions"]]
+    CSV["📁 creditcard.csv"] --> REP["csv_replayer.py\n(host machine)"]
+    REP -->|"NodePort :30093\n192.168.49.2:30093"| KAFKA[["Kafka\ntransactions"]]
 
-    subgraph Cluster ["⚙️ Real-time Processing"]
-        FLINK["Apache Flink"]
-        API["FastAPI ML Server\n:8001"]
-        FLINK <-->|Async HTTP /predict| API
+    subgraph k8s ["☸️ Kubernetes Cluster (Minikube)"]
+        KAFKA --> FLINK["Apache Flink\nJobManager + TaskManager"]
+        FLINK <-->|"Async HTTP /predict"| API["FastAPI ML Server\n:8001"]
+
+        FLINK --> KA[["Kafka\nfraud-alerts"]]
+        FLINK --> CH[("ClickHouse\nfraud_alerts\ntransactions")]
+
+        PROM["Prometheus"] -->|scrape| FLINK
+        PROM -->|scrape| API
+        PROM --> GRAF["Grafana\n:30000"]
     end
-
-    KAFKA_TXN --> FLINK
-
-    subgraph Sinks ["💾 Sinks"]
-        KAFKA_ALERT[["Kafka\nfraud-alerts"]]
-        PG[("PostgreSQL\n(fraud_alerts)")]
-        PG_TXN[("PostgreSQL\n(transactions)")]
-    end
-
-    FLINK --> KAFKA_ALERT & PG & PG_TXN
-
-    subgraph Monitoring ["📊 Monitoring & Observability"]
-        PROM["Prometheus"]
-        GRAF["Grafana\n:3000"]
-        PROM --> GRAF
-    end
-
-    FLINK & API -.->|Scrape metrics| PROM
 ```
 
+### Luồng xử lý chi tiết
 
-1. **Thu thập dữ liệu (Mô phỏng):** Một script Python ([csv_replayer.py](./scripts/csv_replayer.py)) đọc dữ liệu thẻ tín dụng từ Kaggle, tự động phân tích cấu hình từ tệp `.env`, và giả lập đẩy các sự kiện (JSON) vào Kafka topic `transactions` theo thời gian thực.
-2. **Engine Xử Lý Luồng (Apache Flink):**
-   - **Data Validation:** Xác thực dữ liệu Kafka qua [TransactionDeserializer.java](./src/main/java/com/fraud/serialization/TransactionDeserializer.java). Nếu gặp dữ liệu lỗi, Flink ghi nhận vào metric `malformed_messages_total` thay vì làm sập job.
-   - **Machine Learning (Async I/O):** Flink gọi bất đồng bộ sang FastAPI server thông qua [MLInferenceFunction.java](./src/main/java/com/fraud/function/MLInferenceFunction.java) để nhận điểm xác suất gian lận từ mô hình XGBoost. Kết nối HTTP được quản lý qua pool kết nối bất đồng bộ và được thiết lập timeout 4 giây (ngắn hơn Flink timeout 5s) giúp kích hoạt cơ chế tự phục hồi (fail-open) khi FastAPI quá tải mà không làm sập Flink Job.
-3. **Data Sinks:** Các cảnh báo từ AI được bắn ra Kafka topic `fraud-alerts` ([FraudAlertSerializer.java](./src/main/java/com/fraud/serialization/FraudAlertSerializer.java)) và lưu trữ lâu dài vào PostgreSQL ([AlertJdbcSink.java](./src/main/java/com/fraud/sink/AlertJdbcSink.java)).
-4. **Observability:** Prometheus thu thập chỉ số (throughput, latency, tỷ lệ lỗi) từ Flink và FastAPI để Grafana trực quan hóa lên Dashboard.
+| Bước | Thành phần | Mô tả |
+|------|-----------|-------|
+| 1 | `csv_replayer.py` | Đọc `creditcard.csv` (Kaggle), giả lập giao dịch thẻ và đẩy vào Kafka topic `transactions` qua NodePort `192.168.49.2:30093` |
+| 2 | `TransactionDeserializer` | Flink deserialize JSON → `Transaction` object, đếm metric `valid_messages_total` / `malformed_messages_total` |
+| 3 | `MLInferenceFunction` | Async HTTP POST `/predict` tới FastAPI, nhận `fraud_probability`. Timeout HTTP = 4s (< Flink timeout 5s) để tự phục hồi khi ML server quá tải |
+| 4 | `AlertJdbcSink` | Ghi `FraudAlert` vào ClickHouse table `fraud_alerts` (batch 200 rows / 1s) |
+| 5 | `TransactionJdbcSink` | Ghi mọi giao dịch vào ClickHouse table `transactions` (batch 500 rows / 1s) cho analytics |
+| 6 | `KafkaSink` | Phát alert ra topic `fraud-alerts` để downstream consumer xử lý |
+| 7 | Prometheus + Grafana | Scrape metrics từ Flink (`:9249`) và FastAPI (`:8001/metrics`), hiển thị trên Dashboard |
 
 ---
 
-## 📂 Cấu trúc Dự Án
+## 📂 Cấu Trúc Thư Mục
 
 ```text
-.
-├── docker-compose.yml          # Triển khai Hạ tầng (Kafka, Postgres, Prometheus, Grafana)
-├── .env                        # Các biến môi trường, ports (KAFKA_PORT, MODEL_SERVER_PORT, v.v.)
-├── init-db/                    # Script khởi tạo PostgreSQL
-│   └── 01_schema.sql           # Schema cho bảng `transactions` và `fraud_alerts`
-├── ml/                         # Module Machine Learning
-│   ├── download_dataset.sh     # Tải dữ liệu Kaggle
-│   ├── train_model.py          # Script huấn luyện XGBoost (sử dụng RobustScaler, bộ lọc IQR, scale_pos_weight)
-│   ├── model_server.py         # FastAPI quản lý `/predict` và `/models` (hỗ trợ atomic hot-swapping)
-│   ├── tests/                  # Bộ Test tự động cho FastAPI
-│   └── models/                 # Registry (`model_registry.json`) và các file .pkl lưu phiên bản mô hình
-├── monitoring/                 # Module Giám sát
-│   ├── prometheus.yml          # Cấu hình Prometheus Scraping
-│   └── grafana/                # Cấu hình và Dashboard Grafana
-├── pom.xml                     # Thư viện Maven cho Flink
-├── scripts/                    # Các tiện ích
-│   ├── create_topics.sh        # Script tạo Kafka topics
-│   └── csv_replayer.py         # Trình mô phỏng giao dịch
-└── src/main/java/com/fraud/    # Mã nguồn trung tâm Apache Flink (Java 17)
-    ├── config/                 # Cấu hình Pipeline (PipelineConfig.java đọc biến môi trường và .env)
-    ├── function/               # Flink functions (Async ML Inference)
-    ├── model/                  # Data objects (Transaction, FraudAlert)
-    ├── serialization/          # Kafka Deserializers & Validation
-    └── sink/                   # Kết nối PostgreSQL JDBC
+fraud-detection-pipeline/
+├── k8s/                            # Kubernetes manifests
+│   ├── zookeeper.yaml              # Zookeeper (Kafka dependency)
+│   ├── kafka.yaml                  # Kafka broker (internal:9092, external NodePort:30093)
+│   ├── clickhouse.yaml             # ClickHouse + init schema (ConfigMap)
+│   ├── flink.yaml                  # Flink JobManager + TaskManager + Services
+│   ├── ml-server.yaml              # FastAPI ML server (NodePort:30001)
+│   ├── prometheus.yaml             # Prometheus + scrape config (ConfigMap)
+│   └── grafana.yaml                # Grafana + dashboard provisioning
+│
+├── ml/                             # Machine Learning module
+│   ├── Dockerfile                  # Image build cho ml-server (python:3.12-slim)
+│   ├── download_dataset.sh         # Tải creditcard.csv từ Kaggle
+│   ├── train_model.py              # Huấn luyện XGBoost (SMOTE, IQR filter, quality gate AUROC ≥ 0.85)
+│   ├── model_server.py             # FastAPI: /predict, /health, /models, /models/{v}/activate, /metrics
+│   ├── requirements_ml.txt         # Python deps cho Docker image
+│   ├── eda_analysis.ipynb          # Notebook phân tích dữ liệu
+│   ├── models/                     # Artifacts (symlinks trỏ về version mới nhất)
+│   │   ├── fraud_model.pkl         # symlink → fraud_model_<timestamp>.pkl
+│   │   ├── amount_scaler.pkl       # symlink → amount_scaler_<timestamp>.pkl
+│   │   ├── time_scaler.pkl         # symlink → time_scaler_<timestamp>.pkl
+│   │   └── model_registry.json     # Lịch sử tất cả version (AUROC, AUPRC, trained_at)
+│   └── tests/
+│       └── test_model_server.py    # Pytest tests cho FastAPI server
+│
+├── monitoring/
+│   ├── prometheus.yml              # Tham khảo local (config thực tế trong k8s/prometheus.yaml)
+│   └── grafana/
+│       ├── provisioning/           # Tự động cấu hình datasource Prometheus
+│       └── dashboards/
+│           └── fraud_pipeline.json # Dashboard: throughput, latency, fraud rate, model drift
+│
+├── scripts/
+│   ├── create_topics.sh            # Tạo Kafka topics trong K8s
+│   ├── csv_replayer.py             # Giả lập giao dịch → Kafka (chạy trên host)
+│   └── port_forward.sh             # kubectl port-forward Grafana/Prometheus/Flink/ClickHouse/ML
+│
+├── src/main/java/com/fraud/
+│   ├── FraudDetectionJob.java      # Main Flink job: source → ML → sinks
+│   ├── config/
+│   │   └── PipelineConfig.java     # Đọc env vars, cung cấp defaults
+│   ├── function/
+│   │   └── MLInferenceFunction.java # RichAsyncFunction: HTTP pool → FastAPI
+│   ├── model/
+│   │   ├── Transaction.java        # POJO: id, userId, amount, mlFeatures, ...
+│   │   └── FraudAlert.java         # POJO: id, severity, mlProbability, source="ML", ...
+│   ├── serialization/
+│   │   ├── TransactionDeserializer.java  # Kafka → Transaction + metrics
+│   │   └── FraudAlertSerializer.java     # FraudAlert → Kafka bytes
+│   └── sink/
+│       ├── TransactionJdbcSink.java # Flink JDBC → ClickHouse transactions
+│       └── AlertJdbcSink.java       # Flink JDBC → ClickHouse fraud_alerts
+│
+├── .env                            # Biến môi trường cục bộ (xem bảng bên dưới)
+├── .env.example                    # Template để tạo .env
+├── pom.xml                         # Maven: Flink 1.20, ClickHouse JDBC, Jackson, HttpClient5
+└── pyproject.toml                  # Python project config (uv)
 ```
 
 ---
 
-## 🛠️ Công Nghệ Sử Dụng
+## 🛠️ Công Nghệ
 
-- **Stream Processing:** Apache Flink 1.20 (Java 17)
-- **Message Broker:** Apache Kafka 7.6 & Confluent ZooKeeper
-- **Database:** PostgreSQL 16
-- **Observability:** Prometheus & Grafana
-- **Machine Learning:** XGBoost, Scikit-Learn (RobustScaler, SMOTE), Pandas
-- **Model Server:** FastAPI, Uvicorn, Python 3.12 (uv)
-- **Kiểm thử (Testing):** Pytest
+| Lớp | Công nghệ | Phiên bản |
+|-----|----------|----------|
+| Stream Processing | Apache Flink | 1.20 (Java 17) |
+| Message Broker | Apache Kafka (Confluent) | 7.6.0 |
+| Message Broker Coord. | Apache ZooKeeper (Confluent) | 7.6.0 |
+| OLAP Storage | ClickHouse | 24.3-alpine |
+| ML Framework | XGBoost + Scikit-learn (SMOTE) | 2.1.1 / 1.5.1 |
+| Model Server | FastAPI + Uvicorn | Python 3.12 |
+| Observability | Prometheus + Grafana | v2.51.0 / 10.4.0 |
+| Container Orchestration | Kubernetes (Minikube) | v0.0.50 |
 
 ---
 
-## ⚙️ Yêu Cầu Cài Đặt (Prerequisites)
+## ⚙️ Yêu Cầu Cài Đặt
 
-- **Java 17** và **Maven 3.8+** (để biên dịch Java code của Flink)
-- **Python 3.11/3.12** với `uv` hoặc `pip` (để chạy Model Server và Replayer)
-- **Docker 24+** (hỗ trợ Docker Compose v2) để chạy hạ tầng và cụm Flink
-- **Kaggle API Credentials** (`~/.kaggle/kaggle.json`) để tải dữ liệu training.
+| Công cụ | Phiên bản | Dùng để |
+|---------|----------|--------|
+| [Minikube](https://minikube.sigs.k8s.io/) | ≥ 1.32 | Chạy cụm Kubernetes cục bộ |
+| [kubectl](https://kubernetes.io/docs/tasks/tools/) | ≥ 1.28 | Quản lý K8s |
+| Java 17 | 17 | Biên dịch Flink job |
+| Maven | ≥ 3.8 | Build fat JAR |
+| Python | 3.12 | Chạy replayer và ML server local |
+| [uv](https://github.com/astral-sh/uv) | ≥ 0.4 | Quản lý Python environment |
+| Kaggle API key | — | Tải dataset (`~/.kaggle/kaggle.json`) |
 
 ---
 
 ## 🗺️ Port Mapping
 
-*(Các port này có thể thay đổi linh hoạt thông qua file `.env`)*
+Tất cả services sử dụng **NodePort** — truy cập trực tiếp qua `minikube ip` mà không cần port-forward (ngoại trừ Grafana/Prometheus/Flink/ClickHouse/ML Server được port-forward về localhost cho tiện).
 
-| Port       | Dịch vụ                        | Chức năng                                    |
-|------------|--------------------------------|----------------------------------------------|
-| 8081       | Flink Web UI                   | Theo dõi Job Flink và Backpressure           |
-| 9093       | Kafka Broker (External)        | Nơi kết nối Kafka producer/consumer          |
-| 2182       | ZooKeeper                      | Quản lý Kafka cluster                        |
-| 5433       | PostgreSQL                     | Kết nối Database (`frauddb`)                 |
-| 8001       | FastAPI ML server              | Endpoints: `/predict`, `/models`, `/metrics` (MODEL_SERVER_PORT) |
-| 9090       | Prometheus                     | Giám sát metric                              |
-| 3000       | Grafana                        | Xem Dashboard Thời gian thực                 |
-| 9249-9260  | Flink Prometheus Reporters     | Thu thập số liệu nội bộ của Flink            |
+| Port | Dịch vụ | NodePort K8s | Truy cập từ host |
+|------|---------|-------------|-----------------|
+| `9092` | Kafka (internal K8s) | — | Chỉ dùng nội bộ trong cluster |
+| `30093` | Kafka (external) | `30093` | `192.168.49.2:30093` — csv_replayer kết nối trực tiếp |
+| `30123` | ClickHouse HTTP | `30123` | `http://localhost:30123` (qua port-forward) |
+| `30900` | ClickHouse Native | `30900` | Native TCP protocol |
+| `30001` | FastAPI ML Server | `30001` | `http://localhost:30001` (qua port-forward) |
+| `30081` | Flink Web UI | `30081` | `http://localhost:30081` (qua port-forward) |
+| `30090` | Prometheus | `30090` | `http://localhost:30090` (qua port-forward) |
+| `30000` | Grafana | `30000` | `http://localhost:30000` (qua port-forward) |
+
+---
+
+## 📋 Biến Môi Trường (`.env`)
+
+| Biến | Giá trị mặc định | Ai đọc | Mô tả |
+|------|-----------------|--------|-------|
+| `GRAFANA_PORT` | `30000` | `port_forward.sh` | Port forward Grafana ra host (= NodePort) |
+| `PROMETHEUS_PORT` | `30090` | `port_forward.sh` | Port forward Prometheus ra host (= NodePort) |
+| `FLINK_WEB_PORT` | `30081` | `port_forward.sh` | Port forward Flink UI ra host (= NodePort) |
+| `CLICKHOUSE_PORT` | `30123` | `port_forward.sh` | Port forward ClickHouse HTTP ra host (= NodePort) |
+| `MODEL_SERVER_PORT` | `30001` | `port_forward.sh`, `model_server.py` | Port forward ML Server ra host (= NodePort) |
+| `KAFKA_PORT` | `30093` | `csv_replayer.py` | Kafka NodePort — csv_replayer kết nối trực tiếp, không cần port-forward |
+| `KAFKA_BOOTSTRAP` | `192.168.49.2:30093` | `csv_replayer.py` | Kafka bootstrap address đầy đủ (minikube ip:NodePort) |
+| `TRANSACTIONS_TOPIC` | `transactions` | `csv_replayer.py` | Tên Kafka topic giao dịch |
+| `CLICKHOUSE_URL` | `jdbc:clickhouse://localhost:30123/default` | `PipelineConfig.java` (chạy local) | JDBC URL ClickHouse |
+| `CLICKHOUSE_USER` | `default` | `PipelineConfig.java` (chạy local) | User ClickHouse |
+| `CLICKHOUSE_PASSWORD` | `clickhousepass` | `PipelineConfig.java` (chạy local) | Password ClickHouse |
+| `CHECKPOINT_STORAGE` | `file:///tmp/flink-checkpoints/...` | `PipelineConfig.java` (chạy local) | Nơi lưu Flink checkpoints |
+| `ML_THRESHOLD` | `0.5` | `model_server.py` | Ngưỡng xác suất để gán nhãn FRAUD |
+
+> **Lưu ý:** Khi Flink chạy trong K8s, các biến `CLICKHOUSE_*` được inject trực tiếp từ `k8s/flink.yaml` — file `.env` không có hiệu lực với các pod K8s.
 
 ---
 
 ## 🚀 Hướng Dẫn Khởi Chạy
 
-Bạn nên sử dụng nhiều cửa sổ Terminal để chạy lần lượt các bước dưới đây.
+### Bước 0 — Chuẩn bị
 
-### 1. Hạ tầng (Infrastructure)
-Bật Kafka, Zookeeper, Postgres, Prometheus và Grafana. Đừng quên copy `.env.example` thành `.env` trước nhé!
 ```bash
-docker compose up -d
+# 1. Copy cấu hình môi trường
+cp .env.example .env
+
+# 2. Bật Minikube (tối thiểu 6GB RAM, 4 CPU)
+minikube start --memory=6g --cpus=4
+
+# 3. Cài Python dependencies
+uv sync
 ```
 
-### 2. Thiết lập Kafka
+---
+
+### Bước 1 — Triển khai hạ tầng K8s
+
 ```bash
-# Tạo các topics cần thiết
+kubectl apply -f k8s/
+```
+
+Chờ tất cả pod sẵn sàng (khoảng 1-2 phút):
+
+```bash
+kubectl wait --for=condition=ready pod --all --timeout=120s
+```
+
+Kết quả mong đợi:
+
+```
+pod/clickhouse-xxx        condition met
+pod/flink-jobmanager-xxx  condition met
+pod/flink-taskmanager-xxx condition met
+pod/grafana-xxx           condition met
+pod/kafka-xxx             condition met
+pod/ml-server-xxx         condition met
+pod/prometheus-xxx        condition met
+pod/zookeeper-xxx         condition met
+```
+
+---
+
+### Bước 2 — Tạo Kafka Topics
+
+```bash
+chmod +x scripts/create_topics.sh
 ./scripts/create_topics.sh
 ```
 
-### 3. Trí tuệ Nhân tạo (Machine Learning)
+Script sẽ tạo: `transactions` (6 partitions), `fraud-rules` (6 partitions), `fraud-alerts` (6 partitions).
+
+---
+
+### Bước 3 — Chuẩn bị ML Model
+
 ```bash
-# Tải bộ dataset (yêu cầu Kaggle API key)
+# Tải dataset từ Kaggle (cần ~/.kaggle/kaggle.json)
+chmod +x ml/download_dataset.sh
 ./ml/download_dataset.sh
 
-# Huấn luyện mô hình XGBoost
+# Huấn luyện XGBoost (AUROC gate ≥ 0.85, ~2-3 phút)
 uv run python ml/train_model.py
 ```
 
-### 4. Bật API Model Server (Terminal A)
-Giữ Terminal này luôn chạy để Flink có thể giao tiếp với AI và Prometheus có thể lấy metric.
+> Model sẽ được lưu vào `ml/models/` dưới dạng versioned `.pkl` + symlink `fraud_model.pkl` → version mới nhất.
+> Docker image `fraud-ml-server:latest` đã **bake sẵn model** từ bước build — không cần mount volume.
+
+**Build và load Docker image vào Minikube:**
+
 ```bash
-# Chạy trực tiếp qua script Python đọc cấu hình cổng từ .env
-uv run python ml/model_server.py
+# Trỏ Docker CLI vào Minikube's Docker daemon
+eval $(minikube docker-env)
+
+# Build image vào Minikube
+docker build -f ml/Dockerfile -t fraud-ml-server:latest .
+
+# Restart pod để lấy image mới
+kubectl rollout restart deployment/ml-server
+kubectl rollout status deployment/ml-server --timeout=60s
 ```
 
-### 5. Biên Biên Dịch Java Code và Nộp Job (Terminal B)
-Dùng Maven để đóng gói Fat JAR và triển khai trực tiếp vào container Flink JobManager.
-```bash
-# Biên dịch JAR cục bộ
-mvn clean package -DskipTests
+---
 
-# Nộp Job vào cụm Flink chạy trong Docker
-docker exec -it flink-jobmanager flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
+### Bước 4 — Biên dịch và Nộp Flink Job
+
+```bash
+# Build fat JAR (bỏ qua tests)
+# Nếu mvn không có trong PATH, dùng đường dẫn đầy đủ:
+~/apache-maven-3.9.6/bin/mvn clean package -DskipTests
+# hoặc nếu mvn đã trong PATH:
+# mvn clean package -DskipTests
+
+# Lấy tên pod JobManager
+JOBMANAGER_POD=$(kubectl get pods -l app=flink,component=jobmanager -o jsonpath='{.items[0].metadata.name}')
+echo "JobManager: $JOBMANAGER_POD"
+
+# Copy JAR vào pod
+kubectl cp target/fraud-detection-pipeline-1.0.jar $JOBMANAGER_POD:/opt/flink/usrlib/
+
+# Submit job (detached mode)
+kubectl exec -it $JOBMANAGER_POD -- flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
 ```
-*Truy cập [http://localhost:8081](http://localhost:8081) để kiểm tra UI và trạng thái Job Flink.*
 
-### 6. Bật Trình Giả Lập Dữ Liệu (Terminal C)
-Script này sẽ giả vờ làm cổng thanh toán, bơm liên tục các giao dịch vào Kafka.
+Kiểm tra job đã chạy:
+
 ```bash
+kubectl exec -it $JOBMANAGER_POD -- flink list
+# Kết quả mong đợi: Fraud Detection Pipeline v2.0 (ML only) (RUNNING)
+```
+
+---
+
+### Bước 5 — Mở Port Forwards
+
+Kafka kết nối trực tiếp qua NodePort — **không cần port-forward cho Kafka**. Chỉ cần port-forward các service có dashboard web:
+
+```bash
+# Chạy trong terminal riêng và giữ terminal đó mở
+./scripts/port_forward.sh
+```
+
+Sau khi chạy xong, truy cập được:
+- Grafana: `http://localhost:30000`
+- Prometheus: `http://localhost:30090`
+- Flink UI: `http://localhost:30081`
+- ClickHouse: `http://localhost:30123`
+- ML Server: `http://localhost:30001`
+
+---
+
+### Bước 6 — Phát Dữ Liệu
+
+Kafka được truy cập qua NodePort `192.168.49.2:30093` — script tự đọc `KAFKA_BOOTSTRAP` từ `.env`:
+
+```bash
+# Phát toàn bộ dataset (~284.807 giao dịch) ở tốc độ 5x
 PYTHONPATH=. uv run python scripts/csv_replayer.py --speed 5
+
+# Chỉ phát giao dịch fraud (492 dòng) để test phát hiện
+PYTHONPATH=. uv run python scripts/csv_replayer.py --fraud-only --speed 10
+
+# Test nhanh (200 giao dịch ở tốc độ cao)
+PYTHONPATH=. uv run python scripts/csv_replayer.py --speed 200 --limit 200
 ```
 
 ---
 
-## 📊 Quan Sát (Monitoring & Observability)
+## 📊 Quan Sát (Monitoring)
 
-Sau khi dòng dữ liệu bắt đầu chảy, bạn có thể kiểm tra sức khỏe hệ thống:
+Sau khi dữ liệu bắt đầu chảy (cần chạy `port_forward.sh` trước):
 
-1. **Grafana Dashboard:** Vào `http://localhost:3000` (User: `admin` / Pass: `fraudadmin` - hoặc xem trong `.env`). Mở **Dashboards > Fraud Pipeline**.
-2. **Kiểm tra Database:**
-   ```bash
-   docker exec -i fraud-postgres psql -U frauduser -d frauddb -c "
-   SELECT pattern_name, severity, amount, source FROM fraud_alerts LIMIT 5;
-   "
-   ```
+| Dashboard | URL | Credentials |
+|-----------|-----|-------------|
+| Grafana | `http://localhost:30000` | admin / fraudadmin |
+| Prometheus | `http://localhost:30090` | — |
+| Flink Web UI | `http://localhost:30081` | — |
+| ML Server | `http://localhost:30001/health` | — |
 
----
+> Hoặc truy cập trực tiếp qua NodePort (không cần port-forward): `http://$(minikube ip):30000`
 
-## 🧠 Quản Lý Phiên Bản Model (Hot-Swapping)
-
-Server Machine Learning lưu toàn bộ lịch sử các mô hình đã huấn luyện trong `model_registry.json`.
-Giả sử bạn vừa train lại thông số AI và muốn thay đổi mô hình ngay lập tức mà không muốn Flink bị gián đoạn:
-
-1. Chạy `uv run python ml/train_model.py` để ra version mới.
-2. Kiểm tra các version đang có sẵn:
-   ```bash
-   curl -s http://localhost:8001/models
-   ```
-3. **Hot-Swap Model (Thay nóng):** Kích hoạt version mới (hoặc Rollback về version cũ):
-   ```bash
-   curl -X POST http://localhost:8001/models/<version-id>/activate
-   ```
-   *Ngay lập tức, Server AI sẽ nạp mô hình mới vào RAM thông qua phép gán atomic swap, và Flink sẽ được dùng mô hình mới nhất này cho các giao dịch tiếp theo.*
-
----
-
-## 🧪 Kiểm Thử (Automated Testing)
-
-- **Test Python (FastAPI/ML Server):** Đảm bảo API scale dữ liệu chuẩn xác, và tính năng chuyển đổi model linh hoạt.
-  ```bash
-  PYTHONPATH=. uv run pytest ml/tests/
-  ```
-
----
-
-## 🔄 Hướng Dẫn Chạy Lại Từ Đầu (Reset Dữ Liệu Cũ)
-
-Nếu bạn muốn làm sạch hệ thống và chạy lại dữ liệu mô phỏng từ đầu:
-
-1. **Dừng và xóa sạch dữ liệu cũ (Containers, Volumes, và Topics)**:
-   ```bash
-   docker compose down -v
-   ```
-2. **Xóa lưu trữ Flink Checkpoints trên host**:
-   ```bash
-   rm -rf /tmp/flink-checkpoints/
-   ```
-3. **Khởi động lại hạ tầng Docker**:
-   ```bash
-   docker compose up -d
-   ```
-4. **Tạo lại các Kafka topics**:
-   ```bash
-   ./scripts/create_topics.sh
-   ```
-5. **Nộp lại Job Flink** (không cần compile lại JAR nếu code không đổi):
-   ```bash
-   docker exec -it flink-jobmanager flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
-   ```
-6. **Chạy lại Model Server và Replayer** ở các terminal tương ứng:
-   ```bash
-   # Terminal A - Chạy AI Model Server (nếu đã tắt)
-   PYTHONPATH=. uv run python ml/model_server.py
-
-   # Terminal C - Phát lại dữ liệu giao dịch từ đầu
-   PYTHONPATH=. uv run python scripts/csv_replayer.py --speed 5
-   ```
-
----
-
-## 🛑 Hướng Dẫn Tắt Hệ Thống
+**Kiểm tra dữ liệu trong ClickHouse:**
 
 ```bash
-# Xóa các container Docker (bao gồm cả Kafka, Postgres, Flink, v.v.)
-docker compose down
+# Xem giao dịch gần nhất
+kubectl exec -it deploy/clickhouse -- \
+  clickhouse-client --password clickhousepass \
+  --query "SELECT id, user_id, amount, status, event_time FROM transactions ORDER BY event_time DESC LIMIT 5;"
+
+# Xem fraud alerts
+kubectl exec -it deploy/clickhouse -- \
+  clickhouse-client --password clickhousepass \
+  --query "SELECT user_id, pattern_name, severity, ml_probability, detected_at FROM fraud_alerts ORDER BY detected_at DESC LIMIT 5;"
+
+# Thống kê tổng
+kubectl exec -it deploy/clickhouse -- \
+  clickhouse-client --password clickhousepass \
+  --query "SELECT count() as total FROM transactions UNION ALL SELECT count() FROM fraud_alerts;"
 ```
+
+**Kiểm tra Kafka alerts:**
+
+```bash
+kubectl exec -it deploy/kafka -- \
+  kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic fraud-alerts \
+  --from-beginning \
+  --max-messages 5
+```
+
+---
+
+## 🔄 Hot-Swap Model (Thay Model Không Downtime)
+
+Server ML lưu toàn bộ lịch sử phiên bản trong `ml/models/model_registry.json`.
+
+```bash
+# Xem các phiên bản đang có
+curl -s http://localhost:30001/models | python3 -m json.tool
+
+# Huấn luyện version mới
+uv run python ml/train_model.py
+
+# Kích hoạt version cụ thể (không cần restart pod)
+curl -X POST http://localhost:30001/models/<version-timestamp>/activate
+
+# Rollback về version cũ
+curl -X POST http://localhost:30001/models/20260521_133240/activate
+
+# Kiểm tra version đang active
+curl -s http://localhost:30001/health
+```
+
+> **Cơ chế:** `_load_version()` dùng atomic swap (`global _state = {...}`) — GIL của Python đảm bảo an toàn luồng, không cần lock.
+
+---
+
+## 🧪 Kiểm Thử Tự Động
+
+```bash
+# Test FastAPI model server (cần model đã train)
+PYTHONPATH=. uv run pytest ml/tests/ -v
+```
+
+---
+
+## 🔁 Reset Toàn Bộ (Chạy Lại Từ Đầu)
+
+```bash
+# 1. Xóa tất cả K8s resources
+kubectl delete -f k8s/
+
+# 2. Xóa Flink checkpoints trên host
+# (thư mục thuộc root vì Flink chạy trong container — dùng sudo)
+sudo rm -rf /tmp/flink-checkpoints/ 2>/dev/null || true
+
+# 3. Triển khai lại
+kubectl apply -f k8s/
+
+# 4. Chờ pods sẵn sàng
+kubectl wait --for=condition=ready pod --all --timeout=120s
+
+# 5. Tạo lại Kafka topics
+./scripts/create_topics.sh
+
+# 6. Submit lại Flink job (JAR đã có sẵn trong pod từ lần trước qua PVC)
+JOBMANAGER_POD=$(kubectl get pods -l app=flink,component=jobmanager -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -it $JOBMANAGER_POD -- flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
+
+# 7. Mở port-forwards (terminal riêng)
+./scripts/port_forward.sh
+```
+
+---
+
+## 🛑 Tắt Hệ Thống
+
+```bash
+# Dừng tất cả K8s resources
+kubectl delete -f k8s/
+
+# (Tuỳ chọn) Dừng Minikube
+minikube stop
+```
+
+---
+
+## 🐛 Troubleshooting
+
+| Triệu chứng | Nguyên nhân | Giải pháp |
+|-------------|------------|-----------|
+| `csv_replayer.py` báo `NoBrokersAvailable` | `KAFKA_BOOTSTRAP` trong `.env` sai hoặc Kafka NodePort chưa ready | Kiểm tra `nc -zv 192.168.49.2 30093` và xem log Kafka pod |
+| Flink job fail ngay sau submit | JAR chưa có trong `/opt/flink/usrlib/` | Chạy lại `kubectl cp ...` rồi submit |
+| ClickHouse pod crash (exit code 76) | `CLICKHOUSE_PASSWORD` trống trong `k8s/clickhouse.yaml` | Kiểm tra env vars trong manifest |
+| ML server pod `CrashLoopBackOff` | Image `fraud-ml-server:latest` chưa có trong Minikube | `eval $(minikube docker-env)` rồi build lại |
+| Không thấy fraud alerts trong ClickHouse | ML threshold quá cao hoặc model chưa load | `curl localhost:30001/health` — kiểm tra `model_loaded: true` |
+| Grafana hiển thị "No data" | Prometheus chưa scrape được | Kiểm tra `Status > Targets` tại `http://localhost:30090` |
+| `port_forward.sh` drop kết nối | Script bị kill khi đóng terminal | Chạy script trong terminal riêng và giữ mở; không dùng `&` trong background |
+| `rm -rf /tmp/flink-checkpoints/` báo Permission denied | Thư mục thuộc user 9999 (Flink container) | Dùng `sudo rm -rf` — checkpoint mới sẽ tự tạo khi submit job |

@@ -25,12 +25,14 @@
       <scope>provided</scope>
     </dependency>
 
-    <!-- Flink CEP -->
+    <!-- Flink CEP (reserved — uncomment if adding rule-based pattern detection) -->
+    <!--
     <dependency>
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-cep</artifactId>
       <version>${flink.version}</version>
     </dependency>
+    -->
 
     <!-- Kafka connector -->
     <dependency>
@@ -46,11 +48,11 @@
       <version>3.3.0-1.20</version>
     </dependency>
 
-    <!-- PostgreSQL driver -->
+    <!-- ClickHouse driver -->
     <dependency>
-      <groupId>org.postgresql</groupId>
-      <artifactId>postgresql</artifactId>
-      <version>42.7.3</version>
+      <groupId>com.clickhouse</groupId>
+      <artifactId>clickhouse-jdbc</artifactId>
+      <version>0.6.1</version>
     </dependency>
 
     <!-- Async HTTP client (for FastAPI calls) -->

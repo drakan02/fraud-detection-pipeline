@@ -218,6 +218,53 @@
           "datasource": "Prometheus"
         }
       ]
+    },
+    {
+      "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "type": "timeseries",
+      "title": "Model Feature Drift (Z-Score)",
+      "fieldConfig": {
+        "defaults": { 
+          "color": { "mode": "palette-classic" }, 
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1.5 },
+              { "color": "red", "value": 3.0 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "model_feature_drift_zscore",
+          "legendFormat": "{{feature}}",
+          "datasource": "Prometheus"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "type": "timeseries",
+      "title": "Model Prediction Probability Stability",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "none" },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "model_prediction_mean_probability",
+          "legendFormat": "Mean Prob",
+          "datasource": "Prometheus"
+        }
+      ]
     }
   ],
   "refresh": "10s",

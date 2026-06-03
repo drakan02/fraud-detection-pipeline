@@ -5,13 +5,12 @@ public class PipelineConfig {
     // Kafka — host port 9093
     public static final String KAFKA_BOOTSTRAP    = env("KAFKA_BOOTSTRAP",    "localhost:9093");
     public static final String TRANSACTIONS_TOPIC = env("TRANSACTIONS_TOPIC", "transactions");
-    public static final String RULES_TOPIC        = env("RULES_TOPIC",        "fraud-rules");
     public static final String ALERTS_TOPIC       = env("ALERTS_TOPIC",       "fraud-alerts");
 
-    // PostgreSQL — host port 5433, container port 5432
-    public static final String PG_URL      = env("PG_URL",      "jdbc:postgresql://localhost:5433/frauddb");
-    public static final String PG_USER     = env("PG_USER",     "frauduser");
-    public static final String PG_PASSWORD = env("PG_PASSWORD", "fraudpass");
+    // ClickHouse — host/container port 8123 (HTTP interface)
+    public static final String CLICKHOUSE_URL      = env("CLICKHOUSE_URL",      "jdbc:clickhouse://localhost:8123/default");
+    public static final String CLICKHOUSE_USER     = env("CLICKHOUSE_USER",     "default");
+    public static final String CLICKHOUSE_PASSWORD = env("CLICKHOUSE_PASSWORD", "clickhousepass");
 
     // FastAPI model server — port 8001
     public static final String MODEL_SERVER_URL   = env("MODEL_SERVER_URL", "http://localhost:" + env("MODEL_SERVER_PORT", "8001"));

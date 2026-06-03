@@ -1,7 +1,7 @@
 [project]
 name = "fraud-detection-pipeline"
 version = "0.1.0"
-description = "Add your description here"
+description = "Real-time fraud detection pipeline using Apache Flink, Kafka, ClickHouse, and XGBoost on Kubernetes"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

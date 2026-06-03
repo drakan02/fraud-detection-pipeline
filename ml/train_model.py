@@ -100,11 +100,20 @@ ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 versioned_model  = MODEL_DIR / f"fraud_model_{ts}.pkl"
 versioned_amount = MODEL_DIR / f"amount_scaler_{ts}.pkl"
 versioned_time   = MODEL_DIR / f"time_scaler_{ts}.pkl"
+versioned_stats  = MODEL_DIR / f"baseline_stats_{ts}.json"
 
 joblib.dump(model,         versioned_model)
 joblib.dump(amount_scaler, versioned_amount)
 joblib.dump(time_scaler,   versioned_time)
-print(f"Saved versioned models: {ts}")
+
+# Calculate and save baseline stats of the raw features (before SMOTE)
+baseline_stats = {
+    "mean": X_train.mean().to_dict(),
+    "std": X_train.std().to_dict()
+}
+versioned_stats.write_text(json.dumps(baseline_stats, indent=2))
+
+print(f"Saved versioned models and stats: {ts}")
 
 # ── Step 9: Update symlinks (safe atomic replace) ─────────────────────────────
 def update_symlink(link: Path, target: Path) -> None:
@@ -117,6 +126,7 @@ def update_symlink(link: Path, target: Path) -> None:
 update_symlink(MODEL_DIR / "fraud_model.pkl",    versioned_model)
 update_symlink(MODEL_DIR / "amount_scaler.pkl",  versioned_amount)
 update_symlink(MODEL_DIR / "time_scaler.pkl",    versioned_time)
+update_symlink(MODEL_DIR / "baseline_stats.json", versioned_stats)
 print("Symlinks updated → latest now points to", ts)
 
 # ── Step 10: Update model registry ────────────────────────────────────────────

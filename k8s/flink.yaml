@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: flink-target-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /home/khang/Code/data-pipeline/fraud-detection-pipeline/target
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flink-target-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: flink-target-pv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink
+      component: jobmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+        - name: jobmanager
+          image: flink:1.20-java17
+          args: ["jobmanager"]
+          ports:
+            - containerPort: 6123
+              name: rpc
+            - containerPort: 8081
+              name: web
+            - containerPort: 9249
+              name: prom-metrics
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: "kafka-service:9092"
+            - name: CLICKHOUSE_URL
+              value: "jdbc:clickhouse://clickhouse-service:8123/default"
+            - name: MODEL_SERVER_URL
+              value: "http://ml-server-service:8001"
+            - name: CLICKHOUSE_USER
+              value: "default"
+            - name: CLICKHOUSE_PASSWORD
+              value: "clickhousepass"
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager-service
+                metrics.reporters: prom
+                metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+                metrics.reporter.prom.port: 9249
+          volumeMounts:
+            - name: flink-target-volume
+              mountPath: /opt/flink/usrlib
+            - name: checkpoints-volume
+              mountPath: /tmp/flink-checkpoints
+      volumes:
+        - name: flink-target-volume
+          persistentVolumeClaim:
+            claimName: flink-target-pvc
+        - name: checkpoints-volume
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  labels:
+    app: flink
+    component: taskmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink
+      component: taskmanager
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+        - name: taskmanager
+          image: flink:1.20-java17
+          args: ["taskmanager"]
+          ports:
+            - containerPort: 6122
+              name: rpc
+            - containerPort: 9249
+              name: prom-metrics
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: "kafka-service:9092"
+            - name: CLICKHOUSE_URL
+              value: "jdbc:clickhouse://clickhouse-service:8123/default"
+            - name: MODEL_SERVER_URL
+              value: "http://ml-server-service:8001"
+            - name: CLICKHOUSE_USER
+              value: "default"
+            - name: CLICKHOUSE_PASSWORD
+              value: "clickhousepass"
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager-service
+                taskmanager.numberOfTaskSlots: 2
+                metrics.reporters: prom
+                metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+                metrics.reporter.prom.port: 9249
+          volumeMounts:
+            - name: flink-target-volume
+              mountPath: /opt/flink/usrlib
+            - name: checkpoints-volume
+              mountPath: /tmp/flink-checkpoints
+      volumes:
+        - name: flink-target-volume
+          persistentVolumeClaim:
+            claimName: flink-target-pvc
+        - name: checkpoints-volume
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager-service
+spec:
+  type: NodePort
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: 6123
+    - name: web
+      port: 8081
+      targetPort: 8081
+      nodePort: 30081
+    - name: blob
+      port: 6124
+      targetPort: 6124
+    - name: prom-metrics
+      port: 9249
+      targetPort: 9249
+  selector:
+    app: flink
+    component: jobmanager
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-taskmanager-service
+spec:
+  ports:
+    - name: prom-metrics
+      port: 9249
+      targetPort: 9249
+  selector:
+    app: flink
+    component: taskmanager

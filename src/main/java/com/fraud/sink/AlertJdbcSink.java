@@ -15,8 +15,7 @@ public class AlertJdbcSink {
         "INSERT INTO fraud_alerts " +
         "(id,transaction_id,user_id,pattern_id,pattern_name,severity," +
         " amount,description,source,ml_probability,detected_at) " +
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?) " +
-        "ON CONFLICT (id) DO NOTHING";
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)";
 
     public static SinkFunction<FraudAlert> build() {
         return JdbcSink.sink(
@@ -30,7 +29,7 @@ public class AlertJdbcSink {
                 stmt.setString(6,  a.severity);
                 stmt.setDouble(7,  a.amount);
                 stmt.setString(8,  a.description);
-                stmt.setString(9,  a.source != null ? a.source : "CEP");
+                stmt.setString(9,  a.source != null ? a.source : "ML");
                 stmt.setDouble(10, a.mlProbability);
                 stmt.setTimestamp(11, Timestamp.from(a.detectedAt));
             },
@@ -39,10 +38,10 @@ public class AlertJdbcSink {
                 .withBatchIntervalMs(1000)
                 .build(),
             new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-                .withUrl(PipelineConfig.PG_URL)
-                .withDriverName("org.postgresql.Driver")
-                .withUsername(PipelineConfig.PG_USER)
-                .withPassword(PipelineConfig.PG_PASSWORD)
+                .withUrl(PipelineConfig.CLICKHOUSE_URL)
+                .withDriverName("com.clickhouse.jdbc.ClickHouseDriver")
+                .withUsername(PipelineConfig.CLICKHOUSE_USER)
+                .withPassword(PipelineConfig.CLICKHOUSE_PASSWORD)
                 .build()
         );
     }
