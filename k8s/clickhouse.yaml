@@ -15,8 +15,8 @@ data:
         status String,
         event_time DateTime64(3),
         ingested_at DateTime DEFAULT now()
-    ) ENGINE = MergeTree()
-    ORDER BY (event_time, user_id, id);
+    ) ENGINE = ReplacingMergeTree()
+    ORDER BY (event_time, id);
 
     CREATE TABLE IF NOT EXISTS default.fraud_alerts (
         id String,
@@ -30,8 +30,8 @@ data:
         source String,
         ml_probability Float64,
         detected_at DateTime64(3) DEFAULT now()
-    ) ENGINE = MergeTree()
-    ORDER BY (detected_at, user_id, id);
+    ) ENGINE = ReplacingMergeTree()
+    ORDER BY (detected_at, id);
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

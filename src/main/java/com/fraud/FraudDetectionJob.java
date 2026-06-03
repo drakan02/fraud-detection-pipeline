@@ -43,7 +43,7 @@ public class FraudDetectionJob {
             .setBootstrapServers(PipelineConfig.KAFKA_BOOTSTRAP)
             .setTopics(PipelineConfig.TRANSACTIONS_TOPIC)
             .setGroupId("fraud-detection-group")
-            .setStartingOffsets(OffsetsInitializer.latest())
+            .setStartingOffsets(OffsetsInitializer.committedOffsets(org.apache.kafka.clients.consumer.OffsetResetStrategy.EARLIEST))
             .setDeserializer(new TransactionDeserializer())
             .build();
 
@@ -64,25 +64,19 @@ public class FraudDetectionJob {
             PipelineConfig.ML_ASYNC_CAPACITY
         ).name("ml-inference");
 
-        // ── Step 4: (Reserved for future CEP/rule-based streams) ────────
-        DataStream<FraudAlert> allAlerts = mlAlerts;
-
-        // ── Step 5: Sinks ─────────────────────────────────────────────────
-        // Kafka alerts sink
+        // ── Step 4: Sinks ─────────────────────────────────────────────────
         KafkaSink<FraudAlert> kafkaAlertSink = KafkaSink.<FraudAlert>builder()
             .setBootstrapServers(PipelineConfig.KAFKA_BOOTSTRAP)
             .setRecordSerializer(new FraudAlertSerializer())
             .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
             .build();
-        allAlerts.sinkTo(kafkaAlertSink).name("kafka-alert-sink");
+        mlAlerts.sinkTo(kafkaAlertSink).name("kafka-alert-sink");
 
-        // ClickHouse alerts sink
-        allAlerts.addSink(AlertJdbcSink.build()).name("clickhouse-alert-sink");
+        mlAlerts.addSink(AlertJdbcSink.build()).name("clickhouse-alert-sink");
 
-        // ClickHouse transactions sink — write every ingested transaction for analytics
         transactions.addSink(TransactionJdbcSink.build()).name("clickhouse-txn-sink");
 
-        // ── Step 6: Execute ───────────────────────────────────────────────
+        // ── Step 5: Execute ───────────────────────────────────────────────
         LOG.info("Submitting Fraud Detection Pipeline (ML only)...");
         env.execute("Fraud Detection Pipeline v2.0 (ML only)");
     }

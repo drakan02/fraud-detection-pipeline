@@ -78,6 +78,13 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
             httpClient.execute(req, new FutureCallback<SimpleHttpResponse>() {
                 @Override
                 public void completed(SimpleHttpResponse resp) {
+                    int statusCode = resp.getCode();
+                    if (statusCode != 200) {
+                        LOG.error("ML server returned HTTP status {} for txn={}: {}", 
+                            statusCode, txn.id, resp.getBodyText());
+                        future.complete(Collections.emptyList());
+                        return;
+                    }
                     try {
                         Map<?, ?> result = mapper.readValue(resp.getBodyText(), Map.class);
                         double prob = ((Number) result.get("fraud_probability")).doubleValue();

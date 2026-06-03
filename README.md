@@ -56,7 +56,7 @@ fraud-detection-pipeline/
 │   ├── flink.yaml                  # Flink JobManager + TaskManager + Services
 │   ├── ml-server.yaml              # FastAPI ML server (NodePort:30001)
 │   ├── prometheus.yaml             # Prometheus + scrape config (ConfigMap)
-│   └── grafana.yaml                # Grafana + dashboard provisioning
+│   └── grafana.yaml                # Grafana + dashboard + datasource (nhúng trực tiếp qua ConfigMap)
 │
 ├── ml/                             # Machine Learning module
 │   ├── Dockerfile                  # Image build cho ml-server (python:3.12-slim)
@@ -73,17 +73,9 @@ fraud-detection-pipeline/
 │   └── tests/
 │       └── test_model_server.py    # Pytest tests cho FastAPI server
 │
-├── monitoring/
-│   ├── prometheus.yml              # Tham khảo local (config thực tế trong k8s/prometheus.yaml)
-│   └── grafana/
-│       ├── provisioning/           # Tự động cấu hình datasource Prometheus
-│       └── dashboards/
-│           └── fraud_pipeline.json # Dashboard: throughput, latency, fraud rate, model drift
-│
 ├── scripts/
 │   ├── create_topics.sh            # Tạo Kafka topics trong K8s
-│   ├── csv_replayer.py             # Giả lập giao dịch → Kafka (chạy trên host)
-│   └── port_forward.sh             # kubectl port-forward Grafana/Prometheus/Flink/ClickHouse/ML
+│   └── csv_replayer.py             # Giả lập giao dịch → Kafka (chạy trên host)
 │
 ├── src/main/java/com/fraud/
 │   ├── FraudDetectionJob.java      # Main Flink job: source → ML → sinks
@@ -140,40 +132,33 @@ fraud-detection-pipeline/
 
 ## 🗺️ Port Mapping
 
-Tất cả services sử dụng **NodePort** — truy cập trực tiếp qua `minikube ip` mà không cần port-forward (ngoại trừ Grafana/Prometheus/Flink/ClickHouse/ML Server được port-forward về localhost cho tiện).
+Tất cả các dịch vụ được cấu hình kiểu **NodePort** trong Kubernetes, cho phép truy cập trực tiếp từ máy host thông qua **Minikube IP** (mặc định là `192.168.49.2` hoặc có thể kiểm tra bằng lệnh `minikube ip`) mà không cần chạy bất kỳ lệnh port-forward nào:
 
-| Port | Dịch vụ | NodePort K8s | Truy cập từ host |
-|------|---------|-------------|-----------------|
-| `9092` | Kafka (internal K8s) | — | Chỉ dùng nội bộ trong cluster |
-| `30093` | Kafka (external) | `30093` | `192.168.49.2:30093` — csv_replayer kết nối trực tiếp |
-| `30123` | ClickHouse HTTP | `30123` | `http://localhost:30123` (qua port-forward) |
-| `30900` | ClickHouse Native | `30900` | Native TCP protocol |
-| `30001` | FastAPI ML Server | `30001` | `http://localhost:30001` (qua port-forward) |
-| `30081` | Flink Web UI | `30081` | `http://localhost:30081` (qua port-forward) |
-| `30090` | Prometheus | `30090` | `http://localhost:30090` (qua port-forward) |
-| `30000` | Grafana | `30000` | `http://localhost:30000` (qua port-forward) |
+| Dịch vụ | NodePort K8s | Đường dẫn truy cập trực tiếp từ host |
+|---------|-------------|-------------------------------------|
+| **Kafka (external)** | `30093` | `192.168.49.2:30093` (csv_replayer kết nối trực tiếp) |
+| **ClickHouse HTTP** | `30123` | `http://192.168.49.2:30123` |
+| **FastAPI ML Server**| `30001` | `http://192.168.49.2:30001` |
+| **Flink Web UI** | `30081` | `http://192.168.49.2:30081` |
+| **Prometheus** | `30090` | `http://192.168.49.2:30090` |
+| **Grafana** | `30000` | `http://192.168.49.2:30000` (admin/fraudadmin) |
 
 ---
 
 ## 📋 Biến Môi Trường (`.env`)
 
-| Biến | Giá trị mặc định | Ai đọc | Mô tả |
-|------|-----------------|--------|-------|
-| `GRAFANA_PORT` | `30000` | `port_forward.sh` | Port forward Grafana ra host (= NodePort) |
-| `PROMETHEUS_PORT` | `30090` | `port_forward.sh` | Port forward Prometheus ra host (= NodePort) |
-| `FLINK_WEB_PORT` | `30081` | `port_forward.sh` | Port forward Flink UI ra host (= NodePort) |
-| `CLICKHOUSE_PORT` | `30123` | `port_forward.sh` | Port forward ClickHouse HTTP ra host (= NodePort) |
-| `MODEL_SERVER_PORT` | `30001` | `port_forward.sh`, `model_server.py` | Port forward ML Server ra host (= NodePort) |
-| `KAFKA_PORT` | `30093` | `csv_replayer.py` | Kafka NodePort — csv_replayer kết nối trực tiếp, không cần port-forward |
-| `KAFKA_BOOTSTRAP` | `192.168.49.2:30093` | `csv_replayer.py` | Kafka bootstrap address đầy đủ (minikube ip:NodePort) |
-| `TRANSACTIONS_TOPIC` | `transactions` | `csv_replayer.py` | Tên Kafka topic giao dịch |
-| `CLICKHOUSE_URL` | `jdbc:clickhouse://localhost:30123/default` | `PipelineConfig.java` (chạy local) | JDBC URL ClickHouse |
-| `CLICKHOUSE_USER` | `default` | `PipelineConfig.java` (chạy local) | User ClickHouse |
-| `CLICKHOUSE_PASSWORD` | `clickhousepass` | `PipelineConfig.java` (chạy local) | Password ClickHouse |
-| `CHECKPOINT_STORAGE` | `file:///tmp/flink-checkpoints/...` | `PipelineConfig.java` (chạy local) | Nơi lưu Flink checkpoints |
-| `ML_THRESHOLD` | `0.5` | `model_server.py` | Ngưỡng xác suất để gán nhãn FRAUD |
+| Biến | Giá trị mặc định | Mô tả |
+|------|-----------------|-------|
+| `KAFKA_PORT` | `30093` | Kafka NodePort |
+| `KAFKA_BOOTSTRAP` | `192.168.49.2:30093` | Địa chỉ Kafka bootstrap của Minikube |
+| `TRANSACTIONS_TOPIC` | `transactions` | Tên Kafka topic giao dịch |
+| `CLICKHOUSE_URL` | `jdbc:clickhouse://localhost:30123/default` | JDBC URL của ClickHouse khi chạy local |
+| `CLICKHOUSE_USER` | `default` | User ClickHouse |
+| `CLICKHOUSE_PASSWORD` | `clickhousepass` | Password ClickHouse |
+| `CHECKPOINT_STORAGE` | `file:///tmp/flink-checkpoints/` | Nơi lưu Flink checkpoints |
+| `ML_THRESHOLD` | `0.5` | Ngưỡng xác suất gán nhãn FRAUD |
 
-> **Lưu ý:** Khi Flink chạy trong K8s, các biến `CLICKHOUSE_*` được inject trực tiếp từ `k8s/flink.yaml` — file `.env` không có hiệu lực với các pod K8s.
+> **Lưu ý:** Khi chạy trên Kubernetes (Minikube), các cấu hình kết nối giữa Flink, Kafka, ClickHouse và ML Server được lấy trực tiếp từ các file YAML trong thư mục `k8s/` và Service Name nội bộ, không phụ thuộc vào file `.env` của host.
 
 ---
 
@@ -275,8 +260,8 @@ kubectl rollout status deployment/ml-server --timeout=60s
 JOBMANAGER_POD=$(kubectl get pods -l app=flink,component=jobmanager -o jsonpath='{.items[0].metadata.name}')
 echo "JobManager: $JOBMANAGER_POD"
 
-# Copy JAR vào pod
-kubectl cp target/fraud-detection-pipeline-1.0.jar $JOBMANAGER_POD:/opt/flink/usrlib/
+# (Lưu ý: Không cần chạy lệnh 'kubectl cp' vì thư mục ./target của host đã được mount tự động 
+# vào /opt/flink/usrlib trong pod thông qua PersistentVolume flink-target-pvc).
 
 # Submit job (detached mode)
 kubectl exec -it $JOBMANAGER_POD -- flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
@@ -291,27 +276,28 @@ kubectl exec -it $JOBMANAGER_POD -- flink list
 
 ---
 
-### Bước 5 — Mở Port Forwards
+### Bước 5 — Xác định IP của Minikube và Truy Cập Dịch Vụ
 
-Kafka kết nối trực tiếp qua NodePort — **không cần port-forward cho Kafka**. Chỉ cần port-forward các service có dashboard web:
+Tất cả các dịch vụ (Grafana, Flink, Prometheus, ClickHouse) đều được mở trực tiếp dưới dạng NodePort trên địa chỉ IP của Minikube. Bạn không cần thiết lập port-forward.
 
+Xác định IP của Minikube:
 ```bash
-# Chạy trong terminal riêng và giữ terminal đó mở
-./scripts/port_forward.sh
+minikube ip
+# Mặc định thường là 192.168.49.2
 ```
 
-Sau khi chạy xong, truy cập được:
-- Grafana: `http://localhost:30000`
-- Prometheus: `http://localhost:30090`
-- Flink UI: `http://localhost:30081`
-- ClickHouse: `http://localhost:30123`
-- ML Server: `http://localhost:30001`
+Sau khi có IP của Minikube, các dịch vụ có thể được truy cập trực tiếp từ máy host:
+- **Grafana (Dashboard):** `http://<minikube-ip>:30000` (Ví dụ: `http://192.168.49.2:30000`)
+- **Flink Web UI:** `http://<minikube-ip>:30081` (Ví dụ: `http://192.168.49.2:30081`)
+- **Prometheus:** `http://<minikube-ip>:30090` (Ví dụ: `http://192.168.49.2:30090`)
+- **ClickHouse (HTTP):** `http://<minikube-ip>:30123`
+- **ML Server (Health):** `http://<minikube-ip>:30001/health`
 
 ---
 
 ### Bước 6 — Phát Dữ Liệu
 
-Kafka được truy cập qua NodePort `192.168.49.2:30093` — script tự đọc `KAFKA_BOOTSTRAP` từ `.env`:
+Kafka được truy cập qua NodePort `30093` trên IP của Minikube (ví dụ: `192.168.49.2:30093`). Script phát dữ liệu sẽ tự đọc `KAFKA_BOOTSTRAP` từ file `.env`:
 
 ```bash
 # Phát toàn bộ dataset (~284.807 giao dịch) ở tốc độ 5x
@@ -328,16 +314,14 @@ PYTHONPATH=. uv run python scripts/csv_replayer.py --speed 200 --limit 200
 
 ## 📊 Quan Sát (Monitoring)
 
-Sau khi dữ liệu bắt đầu chảy (cần chạy `port_forward.sh` trước):
+Khi dữ liệu bắt đầu chảy, bạn truy cập trực tiếp các Dashboard để giám sát hệ thống:
 
 | Dashboard | URL | Credentials |
 |-----------|-----|-------------|
-| Grafana | `http://localhost:30000` | admin / fraudadmin |
-| Prometheus | `http://localhost:30090` | — |
-| Flink Web UI | `http://localhost:30081` | — |
-| ML Server | `http://localhost:30001/health` | — |
-
-> Hoặc truy cập trực tiếp qua NodePort (không cần port-forward): `http://$(minikube ip):30000`
+| **Grafana** | `http://192.168.49.2:30000` hoặc `http://<minikube-ip>:30000` | admin / fraudadmin |
+| **Flink Web UI** | `http://192.168.49.2:30081` hoặc `http://<minikube-ip>:30081` | — |
+| **Prometheus** | `http://192.168.49.2:30090` hoặc `http://<minikube-ip>:30090` | — |
+| **ML Server** | `http://192.168.49.2:30001/health` hoặc `http://<minikube-ip>:30001/health` | — |
 
 **Kiểm tra dữ liệu trong ClickHouse:**
 
@@ -407,29 +391,30 @@ PYTHONPATH=. uv run pytest ml/tests/ -v
 
 ## 🔁 Reset Toàn Bộ (Chạy Lại Từ Đầu)
 
+Vì toàn bộ các dịch vụ được truy cập trực tiếp qua NodePort, bạn chỉ cần **1 Terminal** duy nhất để chạy toàn bộ quy trình reset và phát dữ liệu:
+
 ```bash
-# 1. Xóa tất cả K8s resources
+# 1. Xóa tất cả K8s resources cũ
 kubectl delete -f k8s/
 
-# 2. Xóa Flink checkpoints trên host
-# (thư mục thuộc root vì Flink chạy trong container — dùng sudo)
+# 2. Xóa Flink checkpoints trên host (nếu có khi chạy local)
 sudo rm -rf /tmp/flink-checkpoints/ 2>/dev/null || true
 
-# 3. Triển khai lại
+# 3. Triển khai lại hạ tầng
 kubectl apply -f k8s/
 
-# 4. Chờ pods sẵn sàng
+# 4. Chờ pods sẵn sàng hoàn toàn
 kubectl wait --for=condition=ready pod --all --timeout=120s
 
 # 5. Tạo lại Kafka topics
 ./scripts/create_topics.sh
 
-# 6. Submit lại Flink job (JAR đã có sẵn trong pod từ lần trước qua PVC)
+# 6. Submit lại Flink job (JAR tự động nhận từ thư mục ./target của host)
 JOBMANAGER_POD=$(kubectl get pods -l app=flink,component=jobmanager -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -it $JOBMANAGER_POD -- flink run -d /opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
 
-# 7. Mở port-forwards (terminal riêng)
-./scripts/port_forward.sh
+# 7. Phát lại dữ liệu giao dịch sạch và gian lận (chạy trên cùng terminal này)
+PYTHONPATH=. uv run python scripts/csv_replayer.py --speed 5
 ```
 
 ---
@@ -454,7 +439,6 @@ minikube stop
 | Flink job fail ngay sau submit | JAR chưa có trong `/opt/flink/usrlib/` | Chạy lại `kubectl cp ...` rồi submit |
 | ClickHouse pod crash (exit code 76) | `CLICKHOUSE_PASSWORD` trống trong `k8s/clickhouse.yaml` | Kiểm tra env vars trong manifest |
 | ML server pod `CrashLoopBackOff` | Image `fraud-ml-server:latest` chưa có trong Minikube | `eval $(minikube docker-env)` rồi build lại |
-| Không thấy fraud alerts trong ClickHouse | ML threshold quá cao hoặc model chưa load | `curl localhost:30001/health` — kiểm tra `model_loaded: true` |
-| Grafana hiển thị "No data" | Prometheus chưa scrape được | Kiểm tra `Status > Targets` tại `http://localhost:30090` |
-| `port_forward.sh` drop kết nối | Script bị kill khi đóng terminal | Chạy script trong terminal riêng và giữ mở; không dùng `&` trong background |
+| Không thấy fraud alerts trong ClickHouse | ML threshold quá cao hoặc model chưa load | Truy cập `http://192.168.49.2:30001/health` — kiểm tra `model_loaded: true` |
+| Grafana hiển thị "No data" | Prometheus chưa scrape được hoặc sai khoảng thời gian | Chọn time range trên cùng bên phải Grafana thành **Last 5 minutes** |
 | `rm -rf /tmp/flink-checkpoints/` báo Permission denied | Thư mục thuộc user 9999 (Flink container) | Dùng `sudo rm -rf` — checkpoint mới sẽ tự tạo khi submit job |

@@ -25,14 +25,7 @@
       <scope>provided</scope>
     </dependency>
 
-    <!-- Flink CEP (reserved — uncomment if adding rule-based pattern detection) -->
-    <!--
-    <dependency>
-      <groupId>org.apache.flink</groupId>
-      <artifactId>flink-cep</artifactId>
-      <version>${flink.version}</version>
-    </dependency>
-    -->
+
 
     <!-- Kafka connector -->
     <dependency>
