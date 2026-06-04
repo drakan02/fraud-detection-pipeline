@@ -16,52 +16,43 @@ Hệ thống phát hiện gian lận thẻ tín dụng theo **thời gian thực
 ```mermaid
 flowchart LR
     subgraph Host ["💻 Host Machine"]
-        CSV["📁 creditcard.csv"] -->|Replay| REP["scripts/csv_replayer.py"]
+        REP["scripts/csv_replayer.py"]
     end
 
-    subgraph Cluster ["☸️ Kubernetes Cluster (Minikube)"]
+    subgraph Cluster ["☸️ Kubernetes Cluster"]
         subgraph Broker ["Message Broker"]
             K_TXN[["Kafka: transactions"]]
             K_ALT[["Kafka: fraud-alerts"]]
         end
 
-        subgraph Processing ["Stream Processing & Serving"]
+        subgraph Processing ["Stream & Serving"]
             FLINK["Apache Flink"]
-            API["FastAPI ML Server<br>(XGBoost Inference)"]
+            API["FastAPI ML Server"]
         end
 
         subgraph DB ["OLAP Database"]
-            CH[("ClickHouse<br>- transactions<br>- model_predictions<br>- ground_truth<br>- fraud_alerts")]
+            CH[("ClickHouse DB")]
         end
 
         subgraph UI ["Observability & UI"]
             DASH["React Dashboard"]
-            PROM["Prometheus"]
-            GRAF["Grafana"]
+            MONITOR["Prometheus & Grafana"]
         end
     end
 
-    %% Data Ingestion Flow
-    REP -->|"Port-Forward: 30093"| K_TXN
+    %% Core Data Flow
+    REP -->|"Port-Forward :30093"| K_TXN
     K_TXN -->|Consume| FLINK
+    FLINK -->|Async HTTP /predict| API
     
-    %% Processing & Inference Flow
-    FLINK <-->|Async HTTP /predict| API
-    API -->|Async Batch Write| CH
-    
-    %% Sinks Flow
-    FLINK -->|JDBC Write| CH
-    FLINK -->|Publish Alerts| K_ALT
+    %% Storage & Output Flow
+    FLINK -->|JDBC Sink| CH
+    API -->|Batch Write| CH
+    FLINK -->|Emit Alerts| K_ALT
 
-    %% WebSocket & Dashboards Flow
-    CH -->|Query Metrics| DASH
-    API <-->|WebSocket CM| DASH
-    DASH -->|Hot-Swap Model| API
-    
-    %% Metrics Scrape
-    PROM -.->|Scrape| FLINK
-    PROM -.->|Scrape| API
-    PROM -->|Query| GRAF
+    %% UI & Metrics Flow
+    CH -->|Query Stats| DASH
+    API -.->|WebSocket CM| DASH
 ```
 
 ### Luồng xử lý chi tiết
@@ -86,6 +77,8 @@ fraud-detection-pipeline/
 ├── k8s/                            # Kubernetes manifests
 │   ├── zookeeper.yaml              # Zookeeper (Kafka dependency)
 │   ├── kafka.yaml                  # Kafka broker (internal:9092, Port-Forward:30093)
+│   ├── secrets.yaml.example        # Template để tạo Secrets (ClickHouse, Grafana)
+│   ├── secrets.yaml                # Cấu hình Secrets thực tế 
 │   ├── clickhouse.yaml             # ClickHouse + init schema (Bảng transactions, fraud_alerts, model_predictions)
 │   ├── flink.yaml                  # Flink JobManager + TaskManager + Services
 │   ├── ml-server.yaml              # FastAPI ML server (Port-Forward:30001)
@@ -120,14 +113,15 @@ fraud-detection-pipeline/
 │   ├── function/
 │   │   └── MLInferenceFunction.java # RichAsyncFunction: HTTP pool → FastAPI (đồng bộ is_fraud nhãn từ ML Server)
 │   ├── model/
-│   │   ├── Transaction.java        # POJO: id, userId, amount, mlFeatures, ...
+│   │   ├── Transaction.java        # POJO: id, amount, status, eventTime, mlFeatures
 │   │   └── FraudAlert.java         # POJO: id, severity, mlProbability, source="ML", ...
 │   ├── serialization/
 │   │   ├── TransactionDeserializer.java  # Kafka → Transaction + metrics
 │   │   └── FraudAlertSerializer.java     # FraudAlert → Kafka bytes
 │   └── sink/
-│       ├── TransactionJdbcSink.java # Flink JDBC → ClickHouse transactions
-│       └── AlertJdbcSink.java       # Flink JDBC → ClickHouse fraud_alerts
+│       ├── TransactionJdbcSink.java  # Flink JDBC → ClickHouse transactions
+│       ├── AlertJdbcSink.java        # Flink JDBC → ClickHouse fraud_alerts
+│       └── GroundTruthJdbcSink.java  # Flink JDBC → ClickHouse ground_truth
 │
 ├── .env                            # Biến môi trường cục bộ 
 ├── .env.example                    # Template để tạo .env
@@ -172,12 +166,12 @@ Tất cả các dịch vụ được cấu hình kiểu **ClusterIP** trong Kube
 
 | Dịch vụ | Cổng Localhost | Đường dẫn truy cập từ host |
 |---------|----------------|----------------------------|
-| **Kafka (external)** | `30093` | `localhost:30093` (csv_replayer kết nối trực tiếp) |
+| **Kafka (external)** | `30093` | `localhost:30093`  |
 | **ClickHouse HTTP** | `30123` | `http://localhost:30123` |
 | **FastAPI ML Server**| `30001` | `http://localhost:30001` |
 | **Flink Web UI** | `30081` | `http://localhost:30081` |
 | **Prometheus** | `30090` | `http://localhost:30090` |
-| **Grafana** | `30000` | `http://localhost:30000` (admin/fraudadmin) |
+| **Grafana** | `30000` | `http://localhost:30000` |
 
 ---
 
@@ -208,8 +202,9 @@ Tất cả các dịch vụ được cấu hình kiểu **ClusterIP** trong Kube
 ### Bước 0 — Chuẩn bị
 
 ```bash
-# 1. Copy cấu hình môi trường
+# 1. Copy cấu hình môi trường và K8s Secrets
 cp .env.example .env
+cp k8s/secrets.yaml.example k8s/secrets.yaml
 
 # 2. Bật Minikube (tối thiểu 6GB RAM, 4 CPU)
 minikube start --memory=6g --cpus=4
@@ -261,7 +256,8 @@ Script sẽ tạo: `transactions` (6 partitions) và `fraud-alerts` (6 partition
 ### Bước 3 — Chuẩn bị ML Model
 
 ```bash
-# Tải dataset từ Kaggle (cần ~/.kaggle/kaggle.json)
+# Tải dataset từ Kaggle
+# *Lưu ý*: Yêu cầu cài thư viện kaggle (pip install kaggle) và đặt token kaggle.json tải từ Kaggle vào thư mục ~/.kaggle/ (Linux/macOS) hoặc %USERPROFILE%\.kaggle\ (Windows) với quyền đọc thích hợp (chmod 600)
 chmod +x ml/download_dataset.sh
 ./ml/download_dataset.sh
 
@@ -303,8 +299,7 @@ TASKMANAGER_POD=$(kubectl get pods -l app=flink,component=taskmanager -o jsonpat
 echo "JobManager: $JOBMANAGER_POD"
 echo "TaskManager: $TASKMANAGER_POD"
 
-# (Lưu ý: Thư mục ./target của host được mount tự động qua PersistentVolume. 
-# Tuy nhiên trong môi trường Minikube, nếu file không tự động cập nhật hoặc bị cache, hãy copy thủ công bằng lệnh sau):
+# Copy file JAR từ host vào các pod Flink (sạch sẽ, không phụ thuộc vào hostPath PV)
 kubectl cp target/fraud-detection-pipeline-1.0.jar $JOBMANAGER_POD:/opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
 kubectl cp target/fraud-detection-pipeline-1.0.jar $TASKMANAGER_POD:/opt/flink/usrlib/fraud-detection-pipeline-1.0.jar
 
@@ -358,7 +353,7 @@ Khi dữ liệu bắt đầu chảy (và đã chạy `port_forward.sh`), truy c�
 | Dashboard | URL | Credentials | Mô tả |
 |-----------|-----|-------------|-------|
 | **Model Web Dashboard** | `http://localhost:30001` | — | Giao diện React hiển thị KPIs, Confusion Matrix thực tế & Hot-swap mô hình |
-| **Grafana** | `http://localhost:30000` | admin / fraudadmin | Giám sát kỹ thuật (Feature Drift, Alert Rates, Latency) |
+| **Grafana** | `http://localhost:30000` | admin / configured password in secrets.yaml | Giám sát kỹ thuật (Feature Drift, Alert Rates, Latency) |
 | **Flink Web UI** | `http://localhost:30081` | — | Theo dõi luồng xử lý và đồ thị Flink |
 | **Prometheus** | `http://localhost:30090` | — | Lưu trữ số liệu máy chủ và ML server metrics |
 | **ML Server Health** | `http://localhost:30001/health` | — | Kiểm tra trạng thái hoạt động của ML Server |
@@ -369,12 +364,12 @@ Khi dữ liệu bắt đầu chảy (và đã chạy `port_forward.sh`), truy c�
 # Xem giao dịch gần nhất
 kubectl exec -it deploy/clickhouse -- \
   clickhouse-client --password clickhousepass \
-  --query "SELECT id, user_id, amount, status, event_time FROM transactions ORDER BY event_time DESC LIMIT 5;"
+  --query "SELECT id, amount, event_time, ingested_at FROM transactions ORDER BY event_time DESC LIMIT 5;"
 
 # Xem fraud alerts
 kubectl exec -it deploy/clickhouse -- \
   clickhouse-client --password clickhousepass \
-  --query "SELECT user_id, pattern_name, severity, ml_probability, detected_at FROM fraud_alerts ORDER BY detected_at DESC LIMIT 5;"
+  --query "SELECT transaction_id, pattern_name, severity, ml_probability, detected_at FROM fraud_alerts ORDER BY detected_at DESC LIMIT 5;"
 
 # Thống kê tổng
 kubectl exec -it deploy/clickhouse -- \

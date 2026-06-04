@@ -1,6 +1,47 @@
 import pytest
+from unittest.mock import MagicMock, patch
+import numpy as np
 from fastapi.testclient import TestClient
 from ml.model_server import app
+
+@pytest.fixture(autouse=True)
+def mock_model_loading():
+    mock_model = MagicMock()
+    def mock_predict_proba(X):
+        if X[0, 0] < -5.0:
+            return np.array([[0.1, 0.9]])
+        return np.array([[0.9, 0.1]])
+    mock_model.predict_proba = mock_predict_proba
+
+    mock_scaler = MagicMock()
+    mock_scaler.transform.return_value = np.array([[1.0]])
+
+    dummy_state = {
+        "model": mock_model,
+        "amount_scaler": mock_scaler,
+        "time_scaler": mock_scaler,
+        "version": "latest",
+        "baseline_mean": {},
+        "baseline_std": {},
+    }
+
+    with patch("ml.model_server._load_version") as mock_load, \
+         patch("ml.model_server.REGISTRY_PATH") as mock_reg, \
+         patch("ml.model_server.sync_ch_write") as mock_write, \
+         patch("ml.model_server.async_ch_query") as mock_query:
+        
+        def load_fake_version(version):
+            import ml.model_server
+            ml.model_server._state = dummy_state
+        mock_load.side_effect = load_fake_version
+        
+        mock_reg.exists.return_value = True
+        mock_reg.read_text.return_value = '[{"version": "latest", "auroc": 0.9}]'
+        
+        mock_write.return_value = None
+        mock_query.return_value = {"data": [{"model_version": "latest"}]}
+        
+        yield
 
 @pytest.fixture
 def client():

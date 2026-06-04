@@ -5,14 +5,14 @@ description = "Real-time fraud detection pipeline using Apache Flink, Kafka, Cli
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.28.1",
+    "httpx==0.27.0",
     "ipykernel>=7.2.0",
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "notebook>=7.5.6",
-    "pandas>=3.0.3",
+    "pandas==2.2.2",
     "prometheus-fastapi-instrumentator>=7.1.0",
-    "pytest>=9.0.3",
+    "pytest==8.3.2",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
 ]

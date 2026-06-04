@@ -44,13 +44,10 @@ def load_env() -> None:
 
 load_env()
 
-KAFKA_PORT = os.getenv("KAFKA_PORT", "9093")
+KAFKA_PORT = os.getenv("KAFKA_PORT", "30093")
 KAFKA      = os.getenv("KAFKA_BOOTSTRAP", f"localhost:{KAFKA_PORT}")
 TOPIC      = os.getenv("TRANSACTIONS_TOPIC", "transactions")
 DATA       = Path("ml/data/creditcard.csv")
-COUNTRIES  = ["VN", "US", "SG", "JP", "GB", "DE", "FR", "AU", "TH", "MY"]
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--speed",      type=float, default=1.0,
@@ -82,12 +79,7 @@ def build_transaction(row, idx: int, base_ts: datetime) -> dict:
     )
     return {
         "id":         str(uuid.uuid4()),
-        "userId":     f"user_{idx % 500:04d}",
-        "cardNumber": f"4{idx % 500:03d}-xxxx-xxxx-{int(row['Amount']) % 9999:04d}",
         "amount":     round(float(row["Amount"]), 2),
-        "currency":   "EUR",
-        "merchantId": f"MER-{idx % 1000:04d}",
-        "country":    COUNTRIES[idx % len(COUNTRIES)],
         # Ground-truth label — used ONLY by GroundTruthJdbcSink in Flink.
         # Not available to the ML model at inference time.
         "status":     "FRAUD" if int(row["Class"]) == 1 else "SUCCESS",
@@ -131,12 +123,12 @@ def main():
                 time.sleep(delta)
         prev_t = float(row["Time"])
 
-        producer.send(TOPIC, key=txn["userId"], value=txn)
+        producer.send(TOPIC, key=txn["id"], value=txn)
         sent += 1
         if txn["status"] == "FRAUD":
             fraud += 1
             print(
-                f"[FRAUD] row={idx:6d} | {txn['userId']} | "
+                f"[FRAUD] row={idx:6d} | {txn['id'][:8]}... | "
                 f"€{txn['amount']:8.2f} | eventTime={txn['eventTime']} | "
                 f"fraud_total={fraud}"
             )

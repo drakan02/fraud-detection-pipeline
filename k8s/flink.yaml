@@ -1,41 +1,5 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PersistentVolume for Flink fat-JAR (host → container mount)
-# NOTE: `hostPath.path` must match the absolute path of the `target/` directory
-# on the Minikube host. If you clone the repo to a different location, update
-# this value accordingly. For a portable alternative, use `minikube mount` or
-# package the JAR inside the Flink image.
-# ─────────────────────────────────────────────────────────────────────────────
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: flink-target-pv
-  labels:
-    type: local
-spec:
-  storageClassName: manual
-  capacity:
-    storage: 1Gi
-  accessModes:
-    - ReadWriteOnce
-  hostPath:
-    # ⚠️  UPDATE THIS PATH if you clone the repo to a different directory.
-    path: /home/khang/Code/data-pipeline/fraud-detection-pipeline/target
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: flink-target-pvc
-spec:
-  storageClassName: manual
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 1Gi
-  volumeName: flink-target-pv
----
-# ─────────────────────────────────────────────────────────────────────────────
 # PersistentVolumeClaim for Flink checkpoints
 # Using a real PVC (not emptyDir!) so checkpoint state survives pod restarts
 # and Flink can recover Kafka offsets + operator state on failure.
@@ -81,6 +45,13 @@ spec:
               name: web
             - containerPort: 9249
               name: prom-metrics
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
           env:
             - name: KAFKA_BOOTSTRAP
               value: "kafka-service:9092"
@@ -105,14 +76,9 @@ spec:
                 metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
                 metrics.reporter.prom.port: 9249
           volumeMounts:
-            - name: flink-target-volume
-              mountPath: /opt/flink/usrlib
             - name: checkpoints-volume
               mountPath: /tmp/flink-checkpoints
       volumes:
-        - name: flink-target-volume
-          persistentVolumeClaim:
-            claimName: flink-target-pvc
         - name: checkpoints-volume
           persistentVolumeClaim:
             claimName: flink-checkpoints-pvc
@@ -145,6 +111,13 @@ spec:
               name: rpc
             - containerPort: 9249
               name: prom-metrics
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
           env:
             - name: KAFKA_BOOTSTRAP
               value: "kafka-service:9092"
@@ -170,14 +143,9 @@ spec:
                 metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
                 metrics.reporter.prom.port: 9249
           volumeMounts:
-            - name: flink-target-volume
-              mountPath: /opt/flink/usrlib
             - name: checkpoints-volume
               mountPath: /tmp/flink-checkpoints
       volumes:
-        - name: flink-target-volume
-          persistentVolumeClaim:
-            claimName: flink-target-pvc
         - name: checkpoints-volume
           persistentVolumeClaim:
             claimName: flink-checkpoints-pvc

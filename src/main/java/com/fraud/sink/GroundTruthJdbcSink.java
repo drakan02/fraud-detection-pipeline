@@ -30,10 +30,10 @@ public class GroundTruthJdbcSink {
         return JdbcSink.sink(
             SQL,
             (stmt, t) -> {
-                stmt.setString(1, t.id);
+                stmt.setString(1, t.getId());
                 // status is "FRAUD" or "SUCCESS" — set by csv_replayer from the
                 // Kaggle dataset Class column (ground truth label, demo-only)
-                stmt.setString(2, t.status != null ? t.status : "SUCCESS");
+                stmt.setString(2, t.getStatus() != null ? t.getStatus() : "SUCCESS");
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(500)

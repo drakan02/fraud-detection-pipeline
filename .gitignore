@@ -32,6 +32,14 @@ ml/models/model_registry.json
 !.env.example
 secrets.json
 kaggle.json
+# k8s/secrets.yaml contains real credentials — never commit.
+# Use k8s/secrets.yaml.example as the committed template instead.
+k8s/secrets.yaml
+
+# =========================
+# DLQ (Dead Letter Queue)
+# =========================
+ml/dlq/
 
 # =========================
 # IDE & OS

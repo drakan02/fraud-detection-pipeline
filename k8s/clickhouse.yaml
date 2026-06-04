@@ -12,12 +12,7 @@ data:
     -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.transactions (
         id           String,
-        user_id      String,
-        card_number  String,
         amount       Decimal(12, 2),
-        currency     String,
-        merchant_id  String,
-        country      String,
         event_time   DateTime64(3),
         ingested_at  DateTime DEFAULT now()
     ) ENGINE = ReplacingMergeTree(ingested_at)
@@ -48,14 +43,13 @@ data:
     CREATE TABLE IF NOT EXISTS default.fraud_alerts (
         id              String,
         transaction_id  String,
-        user_id         String,
         pattern_id      String,
         pattern_name    String,
         severity        String,
         amount          Float64,
         description     String,
         source          String,
-        ml_probability  Float64,
+        ml_probability  Float32,   -- probability in [0,1]; Float32 precision is sufficient
         detected_at     DateTime64(3) DEFAULT now()
     ) ENGINE = MergeTree()
     PARTITION BY toYYYYMM(detected_at)
@@ -66,14 +60,12 @@ data:
     --   One row per (transaction, model_version) pair.
     --   ORDER BY (transaction_id, model_version) so ReplacingMergeTree can
     --   dedup retried predictions correctly.
-    --   shap_values (Deprecated) - kept for schema backward compatibility but no longer used.
     -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.model_predictions (
         transaction_id  String,
         model_version   String,
         probability     Float64,
         prediction      UInt8,
-        shap_values     String DEFAULT '',   -- Deprecated
         predicted_at    DateTime64(3) DEFAULT now(),
         INDEX idx_predicted_at predicted_at TYPE minmax GRANULARITY 1
     ) ENGINE = ReplacingMergeTree()
@@ -115,6 +107,13 @@ spec:
               name: http
             - containerPort: 9000
               name: native
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
           env:
             - name: CLICKHOUSE_USER
               valueFrom:

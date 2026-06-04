@@ -18,24 +18,34 @@ import java.util.Map;
  * via a dispute-resolution process.</p>
  */
 public class Transaction {
-    public String id;
-    public String userId;
-    public String cardNumber;
-    public BigDecimal amount;
-    public String currency;
-    public String merchantId;
-    public String country;
+
+    private String id;
+    private BigDecimal amount;
     /** Ground-truth label for demo evaluation only. NOT stored in transactions table. */
-    public String status;
-    public Instant eventTime;
+    private String status;
+    private Instant eventTime;
     /** PCA features V1-V28 + raw Amount + Time, used as ML inference input. */
-    public Map<String, Double> mlFeatures;
+    private Map<String, Double> mlFeatures;
 
     public Transaction() {}
 
+    public String getId()                       { return id; }
+    public void setId(String id)               { this.id = id; }
+
+    public BigDecimal getAmount()               { return amount; }
+    public void setAmount(BigDecimal amount)   { this.amount = amount; }
+
+    public String getStatus()                   { return status; }
+    public void setStatus(String status)       { this.status = status; }
+
+    public Instant getEventTime()               { return eventTime; }
+    public void setEventTime(Instant eventTime){ this.eventTime = eventTime; }
+
+    public Map<String, Double> getMlFeatures()                      { return mlFeatures; }
+    public void setMlFeatures(Map<String, Double> mlFeatures)      { this.mlFeatures = mlFeatures; }
+
     @Override
     public String toString() {
-        return String.format("Transaction{id=%s, userId=%s, amount=%s, status=%s}",
-            id, userId, amount, status);
+        return String.format("Transaction{id=%s, amount=%s, status=%s}", id, amount, status);
     }
 }

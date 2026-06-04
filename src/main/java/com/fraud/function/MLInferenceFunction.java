@@ -37,11 +37,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p><strong>Retry strategy:</strong> up to {@value MAX_RETRIES} attempts with
  * exponential backoff (100 ms → 200 ms → 400 ms) before falling back.</p>
  *
- * <p><strong>Circuit-breaker / fallback:</strong> If the ML server is
- * unavailable after all retries, a simple rule-based heuristic is applied
- * (Amount > FALLBACK_AMOUNT_THRESHOLD EUR → HIGH-risk alert with
+ * <p><strong>Fallback:</strong> If the ML server is unavailable after all
+ * retries, a simple rule-based heuristic is applied
+ * (Amount &gt; {@value FALLBACK_AMOUNT_THRESHOLD} EUR → HIGH-risk alert with
  * {@code source="RULE_FALLBACK"}). This ensures the pipeline never silently
  * drops suspicious large-amount transactions when ML is down.</p>
+ *
+ * <p><strong>Thread safety:</strong> {@link ObjectMapper} is configured once in
+ * {@link #open} and thereafter used read-only across concurrent HTTP callbacks.
+ * Jackson's ObjectMapper is documented as thread-safe for read operations after
+ * configuration, so no additional locking is needed here.</p>
  */
 public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAlert> {
 
@@ -57,11 +62,20 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
     /** Base backoff delay in milliseconds (doubles on each retry). */
     private static final long BACKOFF_BASE_MS = 100L;
 
+    /**
+     * Pool size for the retry scheduler.
+     * Set to capacity/10 (min 2) so up to ~10% of inflight transactions can
+     * schedule a retry concurrently without blocking each other behind a
+     * single-thread queue.
+     */
+    private static final int SCHEDULER_POOL_SIZE =
+        Math.max(2, PipelineConfig.ML_ASYNC_CAPACITY / 10);
+
     private transient CloseableHttpAsyncClient httpClient;
     private transient ObjectMapper mapper;
     private transient ScheduledExecutorService executorService;
 
-    /** Tracks consecutive ML failures for logging/alerting purposes. */
+    /** Tracks consecutive ML failures for logging purposes. */
     private transient AtomicInteger consecutiveFailures;
 
     @Override
@@ -88,17 +102,20 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
             .setDefaultRequestConfig(requestConfig)
             .build();
         httpClient.start();
-        executorService = Executors.newSingleThreadScheduledExecutor();
+
+        // Use a thread pool (not a single thread) so multiple concurrent retries
+        // don't queue behind each other and trigger Flink's async timeout prematurely.
+        executorService = Executors.newScheduledThreadPool(SCHEDULER_POOL_SIZE);
         mapper = new ObjectMapper();
         consecutiveFailures = new AtomicInteger(0);
 
-        LOG.info("MLInferenceFunction ready — endpoint: {} (pool: max/route={}, max/total={})",
-            ENDPOINT, PipelineConfig.ML_ASYNC_CAPACITY, PipelineConfig.ML_ASYNC_CAPACITY * 2);
+        LOG.info("MLInferenceFunction ready — endpoint: {} (pool: max/route={}, max/total={}, scheduler-threads={})",
+            ENDPOINT, PipelineConfig.ML_ASYNC_CAPACITY, PipelineConfig.ML_ASYNC_CAPACITY * 2, SCHEDULER_POOL_SIZE);
     }
 
     @Override
     public void asyncInvoke(Transaction txn, ResultFuture<FraudAlert> future) {
-        if (txn.mlFeatures == null || txn.mlFeatures.isEmpty()) {
+        if (txn.getMlFeatures() == null || txn.getMlFeatures().isEmpty()) {
             future.complete(Collections.emptyList());
             return;
         }
@@ -114,8 +131,8 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
     private void executeWithRetry(Transaction txn, ResultFuture<FraudAlert> future, int attempt) {
         try {
             Map<String, Object> payload = new java.util.HashMap<>();
-            payload.put("transaction_id", txn.id);
-            payload.put("features", txn.mlFeatures);
+            payload.put("transaction_id", txn.getId());
+            payload.put("features", txn.getMlFeatures());
             String body = mapper.writeValueAsString(payload);
 
             SimpleHttpRequest req = SimpleRequestBuilder.post(ENDPOINT)
@@ -129,7 +146,7 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
                     int statusCode = resp.getCode();
                     if (statusCode != 200) {
                         LOG.error("ML server returned HTTP {} for txn={}: {}",
-                            statusCode, txn.id, resp.getBodyText());
+                            statusCode, txn.getId(), resp.getBodyText());
                         handleFailure(txn, future, attempt,
                             new RuntimeException("HTTP " + statusCode));
                         return;
@@ -140,15 +157,15 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
                         double prob = ((Number) result.get("fraud_probability")).doubleValue();
                         boolean isFraud = (Boolean) result.get("is_fraud");
                         if (isFraud) {
-                            LOG.info("FRAUD_ALERT | ML001 | userId={} | prob={}",
-                                txn.userId, String.format("%.3f", prob));
+                            LOG.info("FRAUD_ALERT | ML001 | txnId={} | prob={}",
+                                txn.getId(), String.format("%.3f", prob));
                             future.complete(Collections.singletonList(
                                 FraudAlert.ml(txn, prob)));
                         } else {
                             future.complete(Collections.emptyList());
                         }
                     } catch (Exception e) {
-                        LOG.error("ML response parse error txn={}: {}", txn.id, e.getMessage());
+                        LOG.error("ML response parse error txn={}: {}", txn.getId(), e.getMessage());
                         future.complete(Collections.emptyList());
                     }
                 }
@@ -180,7 +197,7 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
         if (attempt < MAX_RETRIES) {
             long backoffMs = BACKOFF_BASE_MS * (1L << attempt); // 100, 200, 400 ms
             LOG.warn("ML inference failed for txn={} (attempt {}/{}), retrying in {}ms: {}",
-                txn.id, attempt + 1, MAX_RETRIES, backoffMs, cause.getMessage());
+                txn.getId(), attempt + 1, MAX_RETRIES, backoffMs, cause.getMessage());
             executorService.schedule(
                 () -> executeWithRetry(txn, future, attempt + 1),
                 backoffMs,
@@ -190,7 +207,7 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
             // All retries exhausted — apply rule-based fallback
             if (failures % 100 == 1) {
                 LOG.error("ML server unreachable after {} retries ({} consecutive failures). " +
-                    "Applying rule-based fallback for txn={}.", MAX_RETRIES, failures, txn.id);
+                    "Applying rule-based fallback for txn={}.", MAX_RETRIES, failures, txn.getId());
             }
             future.complete(applyRuleBasedFallback(txn));
         }
@@ -201,10 +218,10 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
      * as HIGH risk with source="RULE_FALLBACK" so they are not silently dropped.
      */
     private java.util.List<FraudAlert> applyRuleBasedFallback(Transaction txn) {
-        if (txn.amount != null &&
-            txn.amount.compareTo(BigDecimal.valueOf(FALLBACK_AMOUNT_THRESHOLD)) > 0) {
+        if (txn.getAmount() != null &&
+            txn.getAmount().compareTo(BigDecimal.valueOf(FALLBACK_AMOUNT_THRESHOLD)) > 0) {
             LOG.warn("RULE_FALLBACK | txn={} | amount={} > threshold={}",
-                txn.id, txn.amount, FALLBACK_AMOUNT_THRESHOLD);
+                txn.getId(), txn.getAmount(), FALLBACK_AMOUNT_THRESHOLD);
             FraudAlert alert = FraudAlert.ruleFallback(txn);
             return Collections.singletonList(alert);
         }
@@ -214,7 +231,7 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
     @Override
     public void timeout(Transaction input, ResultFuture<FraudAlert> resultFuture) throws Exception {
         LOG.warn("Async ML inference timed out ({} ms) for transaction={}. Applying fallback.",
-            PipelineConfig.ML_ASYNC_TIMEOUT_MS, input.id);
+            PipelineConfig.ML_ASYNC_TIMEOUT_MS, input.getId());
         resultFuture.complete(applyRuleBasedFallback(input));
     }
 

@@ -9,7 +9,7 @@ data:
       - name: Prometheus
         type: prometheus
         access: proxy
-        url: http://prometheus:9090
+        url: http://prometheus-service:9090
         isDefault: true
         editable: false
 ---
@@ -338,7 +338,10 @@ spec:
             - containerPort: 3000
           env:
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: "fraudadmin"
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: GRAFANA_ADMIN_PASSWORD
             - name: GF_USERS_ALLOW_SIGN_UP
               value: "false"
             - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH

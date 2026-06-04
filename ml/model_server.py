@@ -15,16 +15,18 @@ import asyncio
 import json
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import httpx
 import joblib
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Gauge
@@ -51,7 +53,23 @@ load_env()
 MODEL_DIR = Path("ml/models")
 REGISTRY_PATH = MODEL_DIR / "model_registry.json"
 
-app = FastAPI(title="Fraud Detection Model Server", version="2.1")
+# ── Model version whitelist pattern (alphanumeric + underscore) -------------------
+_VERSION_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
+
+
+def _sanitize_version(version: str) -> str:
+    """
+    Validate and return version string safe for use in SQL queries.
+    Raises ValueError if the version contains disallowed characters.
+    Only alphanumeric characters and underscores are permitted, matching
+    the format produced by train_model.py (YYYYMMDD_HHMMSS or 'latest').
+    """
+    if not _VERSION_PATTERN.match(version):
+        raise ValueError(
+            f"Invalid model version '{version}': only alphanumeric characters and "
+            "underscores are allowed."
+        )
+    return version
 
 
 # ── Prometheus custom metrics -----------------------------------------------------
@@ -74,9 +92,6 @@ prediction_mean_gauge = Gauge(
     "model_prediction_mean_probability",
     "Rolling average predicted fraud probability (rolling window of 1000)",
 )
-
-# Instrument all FastAPI routes automatically (latency histogram, request count)
-Instrumentator().instrument(app).expose(app)
 
 
 # ── Model state (mutable for hot-swap) -------------------------------------------
@@ -163,12 +178,17 @@ def _load_version(version: str) -> None:
 CH_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
 CH_PORT = os.getenv("CLICKHOUSE_PORT", "30123")
 CH_USER = os.getenv("CLICKHOUSE_USER", "default")
-CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", "clickhousepass")
+CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
+if not CH_PASS:
+    raise ValueError("CLICKHOUSE_PASSWORD environment variable is required and must not be empty.")
 CH_URL = f"http://{CH_HOST}:{CH_PORT}"
 
 # Shared async ClickHouse client for broadcast_loop and /api/predictions.
-# Sync fallback client used only for the ClickHouse writer thread.
 _async_ch_client: Optional[httpx.AsyncClient] = None
+
+# Persistent sync client reused by the writer thread to avoid creating a new
+# TCP connection for every batch write.
+_sync_ch_client: Optional[httpx.Client] = None
 
 
 async def async_ch_query(sql: str) -> dict:
@@ -186,26 +206,30 @@ async def async_ch_query(sql: str) -> dict:
 
 
 def sync_ch_write(sql: str, data: str) -> None:
-    """Blocking ClickHouse INSERT — only called from the writer thread."""
-    with httpx.Client() as client:
-        r = client.post(
-            CH_URL,
-            params={"query": sql},
-            content=data,
-            auth=(CH_USER, CH_PASS),
-            headers={"Content-Type": "text/plain"},
-            timeout=10.0,
-        )
+    """Blocking ClickHouse INSERT using the persistent sync client."""
+    assert _sync_ch_client is not None, "Sync ClickHouse client not initialised"
+    r = _sync_ch_client.post(
+        CH_URL,
+        params={"query": sql},
+        content=data,
+        auth=(CH_USER, CH_PASS),
+        headers={"Content-Type": "text/plain"},
+        timeout=10.0,
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"ClickHouse write failed: {r.text}")
+        raise RuntimeError(f"ClickHouse write failed (HTTP {r.status_code}): {r.text}")
 
 
 # ── Prediction writer thread ------------------------------------------------------
 #   Drain the queue in batches and write to ClickHouse.
 #   Uses a threading.Event so the shutdown handler can request a graceful stop
 #   and wait for the queue to be fully drained before the process exits.
+#
+#   Queue is bounded (maxsize=10_000) to prevent unbounded memory growth when
+#   ClickHouse is slow or unavailable. The /predict endpoint raises HTTP 503
+#   if the queue is full so callers can apply back-pressure.
 
-prediction_queue: queue.Queue = queue.Queue()
+prediction_queue: queue.Queue = queue.Queue(maxsize=10_000)
 _writer_stop_event = threading.Event()
 
 
@@ -233,27 +257,43 @@ def clickhouse_writer_thread() -> None:
                         "model_version": rec["model_version"],
                         "probability": rec["probability"],
                         "prediction": int(rec["prediction"]),
-                        "shap_values": rec.get("shap_values", ""),
                     }
                 )
             )
         data = "\n".join(lines) + "\n"
-        
-        # Write to ClickHouse with retries and DLQ fallback
+
+        # Write to ClickHouse with retries.
+        # Distinguish retry-able server errors (5xx) from permanent client errors
+        # (4xx, e.g. schema mismatch) to avoid wasting retries on non-recoverable failures.
         max_retries = 5
         backoff = 1.0
         success = False
+        last_exc: Optional[Exception] = None
+
         for attempt in range(max_retries):
             try:
                 sync_ch_write("INSERT INTO default.model_predictions FORMAT JSONEachRow", data)
                 success = True
                 break
-            except Exception as exc:
-                print(f"[writer] ClickHouse batch write error (attempt {attempt+1}/{max_retries}): {exc}")
+            except RuntimeError as exc:
+                last_exc = exc
+                exc_msg = str(exc)
+                # Extract HTTP status code from the error message if present.
+                is_client_error = "HTTP 4" in exc_msg
+                if is_client_error:
+                    print(f"[writer] Non-retryable ClickHouse error (4xx) — sending to DLQ immediately: {exc}")
+                    break
+                print(f"[writer] ClickHouse batch write error (attempt {attempt + 1}/{max_retries}): {exc}")
                 if attempt < max_retries - 1:
                     time.sleep(backoff)
                     backoff *= 2.0
-        
+            except Exception as exc:
+                last_exc = exc
+                print(f"[writer] Unexpected write error (attempt {attempt + 1}/{max_retries}): {exc}")
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2.0
+
         if not success:
             try:
                 dlq_dir = Path("ml/dlq")
@@ -287,7 +327,9 @@ async def broadcast_loop() -> None:
             continue
         try:
             now = time.monotonic()
-            active_ver = _state.get("version", "latest")
+
+            with _state_lock:
+                active_ver = _state.get("version", "latest")
 
             # Only re-query ClickHouse when cache is stale.
             if now - _broadcast_cache_ts > _CACHE_TTL_S:
@@ -295,13 +337,24 @@ async def broadcast_loop() -> None:
                     res = await async_ch_query(
                         "SELECT DISTINCT model_version FROM default.model_predictions"
                     )
-                    model_versions = [row["model_version"] for row in res.get("data", [])]
+                    # Sanitize versions read from DB before using in SQL to prevent injection.
+                    raw_versions = [row["model_version"] for row in res.get("data", [])]
+                    model_versions = []
+                    for v in raw_versions:
+                        try:
+                            model_versions.append(_sanitize_version(v))
+                        except ValueError:
+                            print(f"[broadcast] Skipping invalid model version from DB: {v!r}")
                 except Exception as exc:
                     print(f"[broadcast] Error listing model versions: {exc}")
                     model_versions = []
 
-                if active_ver not in model_versions:
-                    model_versions.append(active_ver)
+                try:
+                    safe_active_ver = _sanitize_version(active_ver)
+                    if safe_active_ver not in model_versions:
+                        model_versions.append(safe_active_ver)
+                except ValueError:
+                    pass
 
                 new_cache: dict = {}
                 for version in model_versions:
@@ -309,7 +362,8 @@ async def broadcast_loop() -> None:
                         continue
                     # Join model_predictions against ground_truth (not transactions.status)
                     # to correctly separate inference labels from ground truth labels.
-                    # Limited to the last 24 hours to prevent memory exhaustion and full-table scans.
+                    # Limited to the last 24 hours to prevent memory exhaustion.
+                    # `version` has been validated by _sanitize_version above.
                     stats_sql = f"""
                     SELECT
                         count() AS total,
@@ -384,9 +438,9 @@ async def drift_monitoring_loop() -> None:
                     continue
                 features_snapshot = list(feature_window)
                 predictions_snapshot = list(prediction_window)
-            
+
             with _state_lock:
-                local_state = _state
+                local_state = dict(_state)
 
             if not local_state:
                 continue
@@ -403,21 +457,25 @@ async def drift_monitoring_loop() -> None:
             print(f"[drift] Error calculating drift: {exc}")
 
 
-# ── Startup / Shutdown -----------------------------------------------------------
-@app.on_event("startup")
-async def startup() -> None:
-    global _async_ch_client
+# ── Startup / Shutdown (lifespan context manager) ---------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application startup and shutdown lifecycle."""
+    global _async_ch_client, _sync_ch_client
+
+    # ── Startup ──────────────────────────────────────────────────────────────────
     _load_version("latest")
     _async_ch_client = httpx.AsyncClient()
+    # Persistent sync client for the writer thread — reuses connections across batches.
+    _sync_ch_client = httpx.Client()
     _writer_stop_event.clear()
     threading.Thread(target=clickhouse_writer_thread, daemon=True).start()
     asyncio.create_task(broadcast_loop())
     asyncio.create_task(drift_monitoring_loop())
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    """Gracefully drain the prediction queue before process exits."""
+    # ── Shutdown ─────────────────────────────────────────────────────────────────
     print("[shutdown] Signalling writer thread to stop...")
     _writer_stop_event.set()
     # Block (in a thread) until the queue is fully drained.
@@ -425,6 +483,14 @@ async def shutdown() -> None:
     print("[shutdown] Prediction queue drained — writer thread stopped.")
     if _async_ch_client:
         await _async_ch_client.aclose()
+    if _sync_ch_client:
+        _sync_ch_client.close()
+
+
+app = FastAPI(title="Fraud Detection Model Server", version="2.1", lifespan=lifespan)
+
+# Instrument all FastAPI routes automatically (latency histogram, request count)
+Instrumentator().instrument(app).expose(app)
 
 
 # ── Schema -----------------------------------------------------------------------
@@ -454,9 +520,6 @@ class PredictionResult(BaseModel):
     model_version: str
 
 
-
-
-
 # ── Helper: build scaled feature array ------------------------------------------
 def _build_feature_array(f: TransactionFeatures, state: dict) -> np.ndarray:
     """Scale Amount and Time, return (1, 30) numpy array ready for inference."""
@@ -468,10 +531,13 @@ def _build_feature_array(f: TransactionFeatures, state: dict) -> np.ndarray:
 
 # ── Endpoints -------------------------------------------------------------------
 @app.get("/health")
-def health():
+def health(response: Response):
     with _state_lock:
         ver = _state.get("version", "unknown")
         loaded = bool(_state)
+    if not loaded:
+        response.status_code = 503
+        return {"status": "error", "message": "Model not loaded yet", "model_loaded": False, "model_version": "unknown"}
     return {"status": "ok", "model_loaded": loaded, "model_version": ver}
 
 
@@ -490,14 +556,19 @@ def predict(req: PredictRequest):
         prob = float(local_state["model"].predict_proba(raw)[0][1])
         is_fraud = prob >= float(os.getenv("ML_THRESHOLD", "0.5"))
 
-        # Queue prediction for async ClickHouse write (SHAP removed)
-        prediction_queue.put({
-            "transaction_id": req.transaction_id,
-            "model_version": local_state.get("version", "unknown"),
-            "probability": prob,
-            "prediction": 1 if is_fraud else 0,
-            "shap_values": "",
-        })
+        # Queue prediction for async ClickHouse write.
+        # Return 503 immediately if the queue is full to apply back-pressure
+        # to callers (Flink will retry via its own retry/fallback logic).
+        try:
+            prediction_queue.put_nowait({
+                "transaction_id": req.transaction_id,
+                "model_version": local_state.get("version", "unknown"),
+                "probability": prob,
+                "prediction": 1 if is_fraud else 0,
+            })
+        except queue.Full:
+            print(f"[predict] prediction_queue full — dropping write for {req.transaction_id}")
+            # Still return the prediction result; only the logging is dropped.
 
         fraud_predictions.labels(is_fraud=str(is_fraud).lower()).inc()
 
@@ -516,14 +587,13 @@ def predict(req: PredictRequest):
         raise HTTPException(status_code=422, detail=str(exc))
 
 
-
-
-
 @app.get("/models")
 def list_models():
     """List all versioned models with their metrics from the registry."""
     if not REGISTRY_PATH.exists():
-        return {"active_version": _state.get("version"), "versions": []}
+        with _state_lock:
+            active = _state.get("version")
+        return {"active_version": active, "versions": []}
     registry = json.loads(REGISTRY_PATH.read_text())
     with _state_lock:
         active = _state.get("version")
@@ -533,12 +603,10 @@ def list_models():
 @app.post("/models/{version}/activate")
 def activate_model(version: str):
     """Hot-swap to a specific model version without restarting the server."""
-    import re
-    if not re.match(r"^[a-zA-Z0-9_]+$", version):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid version format. Only alphanumeric characters and underscores are allowed.",
-        )
+    try:
+        _sanitize_version(version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
         _load_version(version)
         return {"status": "ok", "active_version": version}

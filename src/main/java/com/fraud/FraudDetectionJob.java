@@ -54,7 +54,7 @@ public class FraudDetectionJob {
         WatermarkStrategy<Transaction> watermark = WatermarkStrategy
             .<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(5))
             .withTimestampAssigner(
-                (txn, ts) -> txn.eventTime != null ? txn.eventTime.toEpochMilli() : ts);
+                (txn, ts) -> txn.getEventTime() != null ? txn.getEventTime().toEpochMilli() : ts);
 
         DataStream<Transaction> transactions = env
             .fromSource(txnSource, watermark, "kafka-transaction-source");
@@ -71,11 +71,13 @@ public class FraudDetectionJob {
         ).name("ml-inference");
 
         // ── Step 4: Sinks ─────────────────────────────────────────────────
-        // 4a. Kafka alert topic (for downstream consumers)
+        // 4a. Kafka alert topic (for downstream consumers).
+        // EXACTLY_ONCE delivery guarantee via Kafka transactions ensures no
+        // duplicate alerts are produced after Flink recovers from a checkpoint.
         KafkaSink<FraudAlert> kafkaAlertSink = KafkaSink.<FraudAlert>builder()
             .setBootstrapServers(PipelineConfig.KAFKA_BOOTSTRAP)
             .setRecordSerializer(new FraudAlertSerializer())
-            .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+            .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
             .build();
         mlAlerts.sinkTo(kafkaAlertSink).name("kafka-alert-sink");
 

@@ -16,9 +16,16 @@ import org.slf4j.LoggerFactory;
 /**
  * Deserializes Kafka records into Transaction objects.
  *
- * Exposes two Flink Counters (visible in Flink Web UI and Prometheus reporter):
- *   - fraud_pipeline.valid_messages_total
- *   - fraud_pipeline.malformed_messages_total
+ * <p>Exposes two Flink Counters (visible in Flink Web UI and Prometheus reporter):
+ * <ul>
+ *   <li>{@code fraud_pipeline.valid_messages_total}</li>
+ *   <li>{@code fraud_pipeline.malformed_messages_total}</li>
+ * </ul>
+ * </p>
+ *
+ * <p>{@link ObjectMapper} is configured once in {@link #open} and then used
+ * read-only across deserialization calls, making it safe for concurrent access
+ * within the same operator instance.</p>
  */
 public class TransactionDeserializer
         implements KafkaRecordDeserializationSchema<Transaction> {
@@ -52,13 +59,20 @@ public class TransactionDeserializer
         }
         try {
             Transaction txn = mapper.readValue(record.value(), Transaction.class);
-            if (txn.id != null && txn.amount != null) {
+            if (txn.getId() != null && txn.getAmount() != null) {
+                if (txn.getEventTime() == null) {
+                    long ts = record.timestamp();
+                    if (ts <= 0) {
+                        ts = System.currentTimeMillis();
+                    }
+                    txn.setEventTime(java.time.Instant.ofEpochMilli(ts));
+                }
                 validCounter.inc();
                 out.collect(txn);
             } else {
                 malformedCounter.inc();
                 LOG.warn("Transaction missing required fields (id={}, amount={}) — dropped",
-                         txn.id, txn.amount);
+                         txn.getId(), txn.getAmount());
             }
         } catch (Exception e) {
             malformedCounter.inc();

@@ -35,7 +35,7 @@ echo "=========================================================="
 # Custom formatting for a premium console interface
 echo -e "\033[1;36mStarting Kubernetes ClusterIP Port-Forwards to localhost\033[0m"
 echo "=========================================================="
-echo " Grafana      : http://localhost:$GRAFANA_PORT (admin/fraudadmin)"
+echo " Grafana      : http://localhost:$GRAFANA_PORT (user: admin, check k8s/secrets.yaml for password)"
 echo " Prometheus   : http://localhost:$PROMETHEUS_PORT"
 echo " Flink UI     : http://localhost:$FLINK_WEB_PORT"
 echo " ClickHouse   : http://localhost:$CLICKHOUSE_PORT (user: default)"
@@ -50,7 +50,7 @@ sleep 1
 
 # Start port-forwards in background
 kubectl port-forward svc/grafana-service      "$GRAFANA_PORT":3000    > /dev/null 2>&1 &
-kubectl port-forward svc/prometheus           "$PROMETHEUS_PORT":9090 > /dev/null 2>&1 &
+kubectl port-forward svc/prometheus-service   "$PROMETHEUS_PORT":9090 > /dev/null 2>&1 &
 kubectl port-forward svc/flink-jobmanager-service "$FLINK_WEB_PORT":8081 > /dev/null 2>&1 &
 kubectl port-forward svc/clickhouse-service   "$CLICKHOUSE_PORT":8123 > /dev/null 2>&1 &
 kubectl port-forward svc/ml-server-service    "$MODEL_SERVER_PORT":8001 > /dev/null 2>&1 &

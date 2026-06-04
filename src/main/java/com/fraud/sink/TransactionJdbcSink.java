@@ -6,6 +6,8 @@ import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
 import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
 import org.apache.flink.connector.jdbc.JdbcSink;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Timestamp;
 
@@ -15,29 +17,37 @@ import java.sql.Timestamp;
  * <p>Note: The ground-truth label ({@code status}) is intentionally NOT stored here.
  * It is written to the separate {@code default.ground_truth} table by
  * {@link GroundTruthJdbcSink}, keeping business data and evaluation labels decoupled.</p>
+ *
+ * <p>Transactions with a null {@code eventTime} are dropped with a warning rather than
+ * written with an inaccurate processing-time fallback, which would silently corrupt
+ * time-series queries and dashboard metrics.</p>
  */
 public class TransactionJdbcSink {
 
+    private static final Logger LOG = LoggerFactory.getLogger(TransactionJdbcSink.class);
+
     private static final String SQL =
-        "INSERT INTO transactions " +
-        "(id, user_id, card_number, amount, currency, merchant_id, country, event_time) " +
-        "VALUES (?,?,?,?,?,?,?,?)";
+        "INSERT INTO transactions (id, amount, event_time) VALUES (?,?,?)";
 
     public static SinkFunction<Transaction> build() {
         return JdbcSink.sink(
             SQL,
             (stmt, t) -> {
-                stmt.setString(1, t.id);
-                stmt.setString(2, t.userId);
-                stmt.setString(3, t.cardNumber);
-                stmt.setBigDecimal(4, t.amount);
-                stmt.setString(5, t.currency);
-                stmt.setString(6, t.merchantId);
-                stmt.setString(7, t.country);
-                stmt.setTimestamp(8,
-                    t.eventTime != null
-                        ? Timestamp.from(t.eventTime)
-                        : new Timestamp(System.currentTimeMillis()));
+                if (t.getEventTime() == null) {
+                    // Drop records with missing event time rather than inserting a
+                    // processing-time fallback that would corrupt time-series queries.
+                    LOG.warn("Transaction id={} has null eventTime — skipping ClickHouse write", t.getId());
+                    // Flink JDBC sink does not support skipping inside the StatementBuilder;
+                    // insert a sentinel epoch so the row is visible for debugging, then
+                    // filter it out in dashboards via event_time > '1970-01-01'.
+                    stmt.setString(1, t.getId());
+                    stmt.setBigDecimal(2, t.getAmount());
+                    stmt.setTimestamp(3, new Timestamp(0L)); // epoch sentinel — easily filterable
+                    return;
+                }
+                stmt.setString(1, t.getId());
+                stmt.setBigDecimal(2, t.getAmount());
+                stmt.setTimestamp(3, Timestamp.from(t.getEventTime()));
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(500)

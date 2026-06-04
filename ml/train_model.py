@@ -56,7 +56,22 @@ X_test, y_test = df_test[FEATURES], df_test["Class"]
 print(f"Train size: {len(X_train)} | Test size: {len(X_test)}")
 print(f"Train fraud: {y_train.sum()} | Test fraud: {y_test.sum()}")
 
-# ── Step 3.5: Remove extreme outliers from training set for top correlated features (V14, V12) ──
+# ── Step 3.5: Save baseline stats BEFORE outlier removal ──────────────────────
+# Baseline stats represent the raw training distribution (post-scaling, pre-clean)
+# and are used for production feature drift monitoring. Saving them here ensures
+# the drift Z-scores are computed against the true data distribution rather than
+# the cleaned (outlier-removed) subset, which would understate real drift.
+baseline_stats_raw = {
+    "mean": X_train.mean().to_dict(),
+    "std": X_train.std().to_dict()
+}
+print("Baseline stats captured (pre-outlier-removal) for drift monitoring.")
+
+# ── Step 4: Remove extreme outliers from training set for top correlated features (V14, V12) ──
+# Outlier removal is applied only to the fraud class to reduce overfitting on
+# extreme fraud samples while preserving the full non-fraud distribution.
+# This asymmetric removal is intentional: we want the model to generalise
+# across the legitimate-transaction space while avoiding memorising edge-case fraud.
 def remove_outliers(X_df, y_df, features_list, threshold=1.5):
     df_temp = pd.concat([X_df, y_df], axis=1)
     initial_len = len(df_temp)
@@ -66,22 +81,22 @@ def remove_outliers(X_df, y_df, features_list, threshold=1.5):
         iqr = q75 - q25
         cut_off = iqr * threshold
         lower, upper = q25 - cut_off, q75 + cut_off
-        
+
         # Remove extreme outliers of the fraud class to prevent overfitting
         outliers_mask = (df_temp['Class'] == 1) & ((df_temp[feat] < lower) | (df_temp[feat] > upper))
         df_temp = df_temp[~outliers_mask]
-    
+
     print(f"Outlier removal ({features_list}): dropped {initial_len - len(df_temp)} rows.")
     return df_temp.drop('Class', axis=1), df_temp['Class']
 
 X_train, y_train = remove_outliers(X_train, y_train, ['V14', 'V12'])
 
-# ── Step 4: SMOTE on training set only ────────────────────────────────────────
+# ── Step 5: SMOTE on training set only ────────────────────────────────────────
 print("Applying SMOTE...")
 X_res, y_res = SMOTE(random_state=SEED, sampling_strategy=0.1).fit_resample(X_train, y_train)
 print(f"After SMOTE: {X_res.shape} | Fraud: {y_res.sum()}")
 
-# ── Step 5: Train XGBoost ─────────────────────────────────────────────────────
+# ── Step 6: Train XGBoost ─────────────────────────────────────────────────────
 print("Training...")
 ratio = float(y_res.value_counts()[0] / y_res.value_counts()[1])
 model = XGBClassifier(
@@ -92,18 +107,24 @@ model = XGBClassifier(
 )
 model.fit(X_res, y_res, eval_set=[(X_test, y_test)], verbose=100)
 
-# ── Step 6: Evaluate ──────────────────────────────────────────────────────────
+# ── Step 7: Evaluate ──────────────────────────────────────────────────────────
 y_prob = model.predict_proba(X_test)[:, 1]
 auroc = roc_auc_score(y_test, y_prob)
 auprc = average_precision_score(y_test, y_prob)
 print(f"\nAUROC: {auroc:.4f}  AUPRC: {auprc:.4f}")
 print(classification_report(y_test, (y_prob >= 0.5).astype(int)))
 
-# ── Step 7: Quality gate ──────────────────────────────────────────────────────
-assert auroc >= 0.85, f"AUROC {auroc:.4f} below threshold 0.85 — do not deploy"
+# ── Step 8: Quality gate ──────────────────────────────────────────────────────
+# Use an explicit check instead of `assert` so this cannot be bypassed
+# by running Python in optimised mode (`python -O`).
+if auroc < 0.85:
+    raise ValueError(
+        f"Quality gate failed: AUROC {auroc:.4f} is below the minimum threshold of 0.85. "
+        "Model will NOT be saved. Investigate training data or hyperparameters."
+    )
 print(f"✓ Quality gate passed (AUROC {auroc:.4f})")
 
-# ── Step 8: Versioned save ────────────────────────────────────────────────────
+# ── Step 9: Versioned save ────────────────────────────────────────────────────
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -116,16 +137,12 @@ joblib.dump(model,         versioned_model)
 joblib.dump(amount_scaler, versioned_amount)
 joblib.dump(time_scaler,   versioned_time)
 
-# Calculate and save baseline stats of the raw features (before SMOTE)
-baseline_stats = {
-    "mean": X_train.mean().to_dict(),
-    "std": X_train.std().to_dict()
-}
-versioned_stats.write_text(json.dumps(baseline_stats, indent=2))
+# Save the pre-outlier-removal baseline stats for production drift monitoring.
+versioned_stats.write_text(json.dumps(baseline_stats_raw, indent=2))
 
 print(f"Saved versioned models and stats: {ts}")
 
-# ── Step 9: Update symlinks (safe atomic replace) ─────────────────────────────
+# ── Step 10: Update symlinks (safe atomic replace) ─────────────────────────────
 def update_symlink(link: Path, target: Path) -> None:
     """Atomically update symlink to point to new target."""
     tmp = link.with_suffix(".tmp_link")
@@ -139,7 +156,7 @@ update_symlink(MODEL_DIR / "time_scaler.pkl",    versioned_time)
 update_symlink(MODEL_DIR / "baseline_stats.json", versioned_stats)
 print("Symlinks updated → latest now points to", ts)
 
-# ── Step 10: Update model registry ────────────────────────────────────────────
+# ── Step 11: Update model registry ────────────────────────────────────────────
 registry: list = []
 if REGISTRY.exists():
     try:
