@@ -23,8 +23,8 @@ import java.sql.Timestamp;
 public class GroundTruthJdbcSink {
 
     private static final String SQL =
-        "INSERT INTO ground_truth (transaction_id, actual_label) " +
-        "VALUES (?,?)";
+        "INSERT INTO ground_truth (transaction_id, actual_label, raw_label, run_id, data_source) " +
+        "VALUES (?,?,?,?,?)";
 
     public static SinkFunction<Transaction> build() {
         return JdbcSink.sink(
@@ -34,6 +34,9 @@ public class GroundTruthJdbcSink {
                 // status is "FRAUD" or "SUCCESS" — set by csv_replayer from the
                 // Kaggle dataset Class column (ground truth label, demo-only)
                 stmt.setString(2, t.getStatus() != null ? t.getStatus() : "SUCCESS");
+                stmt.setString(3, t.getRawLabel() != null ? t.getRawLabel() : "");
+                stmt.setString(4, t.getRunId() != null && !t.getRunId().isBlank() ? t.getRunId() : "unknown");
+                stmt.setString(5, t.getDataSource() != null && !t.getDataSource().isBlank() ? t.getDataSource() : "unknown");
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(500)

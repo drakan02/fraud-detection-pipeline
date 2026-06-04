@@ -23,6 +23,12 @@ public class Transaction {
     private BigDecimal amount;
     /** Ground-truth label for demo evaluation only. NOT stored in transactions table. */
     private String status;
+    /** Stable replay/batch identifier used for audit queries and dedup analysis. */
+    private String runId;
+    /** Data origin, for example "kaggle-creditcard". */
+    private String dataSource;
+    /** Raw dataset label before mapping to status. Demo-only audit metadata. */
+    private String rawLabel;
     private Instant eventTime;
     /** PCA features V1-V28 + raw Amount + Time, used as ML inference input. */
     private Map<String, Double> mlFeatures;
@@ -38,6 +44,15 @@ public class Transaction {
     public String getStatus()                   { return status; }
     public void setStatus(String status)       { this.status = status; }
 
+    public String getRunId()                    { return runId; }
+    public void setRunId(String runId)          { this.runId = runId; }
+
+    public String getDataSource()               { return dataSource; }
+    public void setDataSource(String dataSource){ this.dataSource = dataSource; }
+
+    public String getRawLabel()                 { return rawLabel; }
+    public void setRawLabel(String rawLabel)    { this.rawLabel = rawLabel; }
+
     public Instant getEventTime()               { return eventTime; }
     public void setEventTime(Instant eventTime){ this.eventTime = eventTime; }
 
@@ -46,6 +61,7 @@ public class Transaction {
 
     @Override
     public String toString() {
-        return String.format("Transaction{id=%s, amount=%s, status=%s}", id, amount, status);
+        return String.format("Transaction{id=%s, amount=%s, status=%s, runId=%s}",
+            id, amount, status, runId);
     }
 }

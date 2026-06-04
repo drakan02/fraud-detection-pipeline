@@ -14,8 +14,8 @@ public class AlertJdbcSink {
     private static final String SQL =
         "INSERT INTO fraud_alerts " +
         "(id,transaction_id,pattern_id,pattern_name,severity," +
-        " amount,description,source,ml_probability,detected_at) " +
-        "VALUES (?,?,?,?,?,?,?,?,?,?)";
+        " amount,description,source,run_id,model_version,threshold,ml_probability,detected_at) " +
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     public static SinkFunction<FraudAlert> build() {
         return JdbcSink.sink(
@@ -29,8 +29,11 @@ public class AlertJdbcSink {
                 stmt.setDouble(6,  a.getAmount());
                 stmt.setString(7,  a.getDescription());
                 stmt.setString(8,  a.getSource() != null ? a.getSource() : "ML");
-                stmt.setDouble(9,  a.getMlProbability());
-                stmt.setTimestamp(10, Timestamp.from(a.getDetectedAt()));
+                stmt.setString(9,  a.getRunId() != null && !a.getRunId().isBlank() ? a.getRunId() : "unknown");
+                stmt.setString(10, a.getModelVersion() != null ? a.getModelVersion() : "unknown");
+                stmt.setDouble(11, a.getThreshold());
+                stmt.setDouble(12, a.getMlProbability());
+                stmt.setTimestamp(13, Timestamp.from(a.getDetectedAt()));
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(200)

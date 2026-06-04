@@ -27,7 +27,8 @@ public class TransactionJdbcSink {
     private static final Logger LOG = LoggerFactory.getLogger(TransactionJdbcSink.class);
 
     private static final String SQL =
-        "INSERT INTO transactions (id, amount, event_time) VALUES (?,?,?)";
+        "INSERT INTO transactions (id, amount, event_time, run_id, data_source) " +
+        "VALUES (?,?,?,?,?)";
 
     public static SinkFunction<Transaction> build() {
         return JdbcSink.sink(
@@ -43,11 +44,15 @@ public class TransactionJdbcSink {
                     stmt.setString(1, t.getId());
                     stmt.setBigDecimal(2, t.getAmount());
                     stmt.setTimestamp(3, new Timestamp(0L)); // epoch sentinel — easily filterable
+                    stmt.setString(4, safe(t.getRunId(), "unknown"));
+                    stmt.setString(5, safe(t.getDataSource(), "unknown"));
                     return;
                 }
                 stmt.setString(1, t.getId());
                 stmt.setBigDecimal(2, t.getAmount());
                 stmt.setTimestamp(3, Timestamp.from(t.getEventTime()));
+                stmt.setString(4, safe(t.getRunId(), "unknown"));
+                stmt.setString(5, safe(t.getDataSource(), "unknown"));
             },
             JdbcExecutionOptions.builder()
                 .withBatchSize(500)
@@ -61,5 +66,9 @@ public class TransactionJdbcSink {
                 .withPassword(PipelineConfig.CLICKHOUSE_PASSWORD)
                 .build()
         );
+    }
+
+    private static String safe(String value, String fallback) {
+        return value != null && !value.isBlank() ? value : fallback;
     }
 }

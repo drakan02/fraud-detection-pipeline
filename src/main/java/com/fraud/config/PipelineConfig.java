@@ -34,7 +34,10 @@ public class PipelineConfig {
     public static final int CHECKPOINT_INTERVAL = Integer.parseInt(env("CHECKPOINT_INTERVAL", "30000"));
     public static final int ML_ASYNC_TIMEOUT_MS = Integer.parseInt(env("ML_ASYNC_TIMEOUT_MS", "5000"));
     public static final int ML_ASYNC_CAPACITY   = Integer.parseInt(env("ML_ASYNC_CAPACITY",   "100"));
-    public static final String CHECKPOINT_STORAGE = env("CHECKPOINT_STORAGE", "file:///tmp/flink-checkpoints/fraud-pipeline");
+    // CHECKPOINT_STORAGE default points to the PVC mount path defined in flink.yaml
+    // (volumeMounts.mountPath = /flink-checkpoints). /tmp was previously the default
+    // but is ephemeral and wiped on pod restart, defeating the purpose of checkpointing.
+    public static final String CHECKPOINT_STORAGE = env("CHECKPOINT_STORAGE", "file:///flink-checkpoints/fraud-pipeline");
 
     private static String env(String key, String defaultVal) {
         String v = System.getenv(key);

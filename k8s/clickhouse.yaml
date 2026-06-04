@@ -7,17 +7,20 @@ data:
     -- ─────────────────────────────────────────────────────────────────────────
     -- Table: transactions
     --   Stores raw transaction business fields arriving from Flink JDBC sink.
-    --   ReplacingMergeTree(ingested_at) deduplicates on ORDER BY key (id),
-    --   keeping the row with the latest ingested_at on background merge.
+    --   ReplacingMergeTree(ingested_at) deduplicates on id, keeping the row
+    --   with the latest ingested_at on background merge. event_time is indexed
+    --   for dashboard time filters without making it part of the dedup key.
     -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.transactions (
         id           String,
         amount       Decimal(12, 2),
         event_time   DateTime64(3),
-        ingested_at  DateTime DEFAULT now()
+        run_id       String DEFAULT 'unknown',
+        data_source  String DEFAULT 'unknown',
+        ingested_at  DateTime DEFAULT now(),
+        INDEX idx_event_time event_time TYPE minmax GRANULARITY 1
     ) ENGINE = ReplacingMergeTree(ingested_at)
-    PARTITION BY toYYYYMM(event_time)
-    ORDER BY (event_time, id);
+    ORDER BY (run_id, id);
 
     -- ─────────────────────────────────────────────────────────────────────────
     -- Table: ground_truth
@@ -30,15 +33,17 @@ data:
     CREATE TABLE IF NOT EXISTS default.ground_truth (
         transaction_id  String,
         actual_label    String,        -- 'FRAUD' | 'SUCCESS'
+        raw_label       String DEFAULT '',
+        run_id          String DEFAULT 'unknown',
+        data_source     String DEFAULT 'unknown',
         created_at      DateTime64(3) DEFAULT now()
     ) ENGINE = ReplacingMergeTree()
-    PARTITION BY toYYYYMM(created_at)
-    ORDER BY transaction_id;
+    ORDER BY (run_id, transaction_id);
 
     -- ─────────────────────────────────────────────────────────────────────────
     -- Table: fraud_alerts
-    --   Append-only alert log; each alert has its own UUID so dedup is
-    --   meaningless — plain MergeTree is the correct engine here.
+    --   Alert IDs are deterministic per (transaction_id, pattern_id, model_version),
+    --   so ReplacingMergeTree can collapse duplicates produced by Flink replay/retry.
     -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.fraud_alerts (
         id              String,
@@ -49,11 +54,13 @@ data:
         amount          Float64,
         description     String,
         source          String,
+        run_id          String DEFAULT 'unknown',
+        model_version   String,
+        threshold       Float64,
         ml_probability  Float32,   -- probability in [0,1]; Float32 precision is sufficient
         detected_at     DateTime64(3) DEFAULT now()
-    ) ENGINE = MergeTree()
-    PARTITION BY toYYYYMM(detected_at)
-    ORDER BY (detected_at, id);
+    ) ENGINE = ReplacingMergeTree(detected_at)
+    ORDER BY (run_id, transaction_id, pattern_id, model_version);
 
     -- ─────────────────────────────────────────────────────────────────────────
     -- Table: model_predictions
@@ -63,14 +70,15 @@ data:
     -- ─────────────────────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS default.model_predictions (
         transaction_id  String,
+        run_id          String DEFAULT 'unknown',
+        data_source     String DEFAULT 'unknown',
         model_version   String,
         probability     Float64,
         prediction      UInt8,
         predicted_at    DateTime64(3) DEFAULT now(),
         INDEX idx_predicted_at predicted_at TYPE minmax GRANULARITY 1
     ) ENGINE = ReplacingMergeTree()
-    PARTITION BY toYYYYMM(predicted_at)
-    ORDER BY (transaction_id, model_version);
+    ORDER BY (run_id, transaction_id, model_version);
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

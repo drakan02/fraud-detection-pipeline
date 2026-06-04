@@ -1,8 +1,13 @@
 
-# ─────────────────────────────────────────────────────────────────────────────
 # PersistentVolumeClaim for Flink checkpoints
 # Using a real PVC (not emptyDir!) so checkpoint state survives pod restarts
 # and Flink can recover Kafka offsets + operator state on failure.
+#
+# ⚠ IMPORTANT: accessModes: ReadWriteOnce allows only ONE node to mount this PVC.
+# If JobManager and TaskManager are scheduled on DIFFERENT nodes, the second pod
+# will fail with "Multi-Attach error". For multi-node clusters:
+#   - Use ReadWriteMany with NFS/CSI driver, OR
+#   - Configure CHECKPOINT_STORAGE to point to S3/MinIO (recommended for production).
 # ─────────────────────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -77,7 +82,7 @@ spec:
                 metrics.reporter.prom.port: 9249
           volumeMounts:
             - name: checkpoints-volume
-              mountPath: /tmp/flink-checkpoints
+              mountPath: /flink-checkpoints
       volumes:
         - name: checkpoints-volume
           persistentVolumeClaim:
@@ -144,7 +149,7 @@ spec:
                 metrics.reporter.prom.port: 9249
           volumeMounts:
             - name: checkpoints-volume
-              mountPath: /tmp/flink-checkpoints
+              mountPath: /flink-checkpoints
       volumes:
         - name: checkpoints-volume
           persistentVolumeClaim:

@@ -21,6 +21,7 @@ ml/data/
 ml/models/*.pkl
 ml/models/baseline_stats*.json
 ml/models/model_registry.json
+ml/models/active_version.txt
 *.egg-info/
 .pytest_cache/
 

@@ -1,3 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ml-prediction-dlq-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +43,13 @@ spec:
               value: "8001"
             - name: ML_THRESHOLD
               value: "0.5"
+            - name: PREDICTION_DLQ_DIR
+              value: "/app/ml/dlq"
+            - name: MODEL_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fraud-pipeline-secrets
+                  key: MODEL_ADMIN_API_KEY
             - name: CLICKHOUSE_HOST
               value: "clickhouse-service"
             - name: CLICKHOUSE_PORT
@@ -65,6 +83,13 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 3
+          volumeMounts:
+            - name: prediction-dlq
+              mountPath: /app/ml/dlq
+      volumes:
+        - name: prediction-dlq
+          persistentVolumeClaim:
+            claimName: ml-prediction-dlq-pvc
 ---
 apiVersion: v1
 kind: Service

@@ -9,6 +9,8 @@ import com.fraud.serialization.TransactionDeserializer;
 import com.fraud.sink.AlertJdbcSink;
 import com.fraud.sink.GroundTruthJdbcSink;
 import com.fraud.sink.TransactionJdbcSink;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.base.DeliveryGuarantee;
@@ -35,11 +37,19 @@ public class FraudDetectionJob {
         env.setParallelism(PipelineConfig.PARALLELISM);
         env.enableCheckpointing(PipelineConfig.CHECKPOINT_INTERVAL,
             CheckpointingMode.EXACTLY_ONCE);
+        env.setRestartStrategy(RestartStrategies.failureRateRestart(
+            3,
+            Time.minutes(5),
+            Time.seconds(10)
+        ));
         // Checkpoint storage backed by a PersistentVolumeClaim so state
         // survives pod restarts and Flink can recover Kafka offsets + operator
         // state automatically without replaying from the beginning.
         env.getCheckpointConfig().setCheckpointStorage(
             PipelineConfig.CHECKPOINT_STORAGE);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
+        env.getCheckpointConfig().setCheckpointTimeout(60000);
+        env.getCheckpointConfig().setTolerableCheckpointFailureNumber(3);
 
         // ── Step 2: Transaction source ─────────────────────────────────────
         KafkaSource<Transaction> txnSource = KafkaSource.<Transaction>builder()

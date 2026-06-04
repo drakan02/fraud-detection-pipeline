@@ -132,6 +132,8 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
         try {
             Map<String, Object> payload = new java.util.HashMap<>();
             payload.put("transaction_id", txn.getId());
+            payload.put("run_id", txn.getRunId());
+            payload.put("data_source", txn.getDataSource());
             payload.put("features", txn.getMlFeatures());
             String body = mapper.writeValueAsString(payload);
 
@@ -156,17 +158,28 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
                         Map<?, ?> result = mapper.readValue(resp.getBodyText(), Map.class);
                         double prob = ((Number) result.get("fraud_probability")).doubleValue();
                         boolean isFraud = (Boolean) result.get("is_fraud");
+                        // Read optional algorithm name returned by the model server
+                        // so the alert accurately reflects which model fired
+                        // (XGBoost, LightGBM, or CatBoost — whichever won training).
+                        Object algObj = result.get("algorithm");
+                        String algorithm = algObj instanceof String ? (String) algObj : null;
+                        Object versionObj = result.get("model_version");
+                        String modelVersion = versionObj instanceof String ? (String) versionObj : "unknown";
+                        Object thresholdObj = result.get("threshold");
+                        double threshold = thresholdObj instanceof Number
+                            ? ((Number) thresholdObj).doubleValue()
+                            : 0.5;
                         if (isFraud) {
-                            LOG.info("FRAUD_ALERT | ML001 | txnId={} | prob={}",
-                                txn.getId(), String.format("%.3f", prob));
+                            LOG.info("FRAUD_ALERT | ML001 | txnId={} | prob={} | algo={} | version={} | threshold={}",
+                                txn.getId(), String.format("%.3f", prob), algorithm, modelVersion, threshold);
                             future.complete(Collections.singletonList(
-                                FraudAlert.ml(txn, prob)));
+                                FraudAlert.ml(txn, prob, algorithm, modelVersion, threshold)));
                         } else {
                             future.complete(Collections.emptyList());
                         }
                     } catch (Exception e) {
                         LOG.error("ML response parse error txn={}: {}", txn.getId(), e.getMessage());
-                        future.complete(Collections.emptyList());
+                        handleFailure(txn, future, attempt, e);
                     }
                 }
 
@@ -177,12 +190,13 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
 
                 @Override
                 public void cancelled() {
-                    future.complete(Collections.emptyList());
+                    handleFailure(txn, future, attempt,
+                        new RuntimeException("HTTP request cancelled"));
                 }
             });
         } catch (Exception e) {
             LOG.error("ML asyncInvoke serialisation error: {}", e.getMessage());
-            future.complete(Collections.emptyList());
+            handleFailure(txn, future, attempt, e);
         }
     }
 
@@ -239,6 +253,19 @@ public class MLInferenceFunction extends RichAsyncFunction<Transaction, FraudAle
     public void close() throws Exception {
         if (executorService != null) {
             executorService.shutdown();
+            // Wait for in-flight retry tasks to complete before closing the operator.
+            // Without awaitTermination, a retry scheduled just before close() could call
+            // ResultFuture.complete() on an already-closed Flink operator and throw
+            // IllegalStateException, corrupting the checkpoint barrier.
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executorService.shutdownNow();
+                    LOG.warn("executorService did not terminate in 5s — forcing shutdown");
+                }
+            } catch (InterruptedException ie) {
+                executorService.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
         if (httpClient != null) {
             httpClient.close();

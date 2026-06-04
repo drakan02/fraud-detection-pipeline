@@ -18,14 +18,15 @@ Usage:
   python scripts/csv_replayer.py --speed 10         # 10x faster
   python scripts/csv_replayer.py --fraud-only        # fraud rows only
   python scripts/csv_replayer.py --speed 50 --limit 2000
+  python scripts/csv_replayer.py --run-id demo-2     # distinct replay run
 """
 import argparse
 import json
 import os
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pandas as pd
 from kafka import KafkaProducer
@@ -48,6 +49,8 @@ KAFKA_PORT = os.getenv("KAFKA_PORT", "30093")
 KAFKA      = os.getenv("KAFKA_BOOTSTRAP", f"localhost:{KAFKA_PORT}")
 TOPIC      = os.getenv("TRANSACTIONS_TOPIC", "transactions")
 DATA       = Path("ml/data/creditcard.csv")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--speed",      type=float, default=1.0,
@@ -56,10 +59,12 @@ def parse_args():
                    help="Maximum number of rows to send")
     p.add_argument("--fraud-only", action="store_true",
                    help="Only replay rows where Class == 1 (fraud)")
+    p.add_argument("--run-id", default="creditcardfraud-demo",
+                   help="Stable replay id. Use a new value to create a distinct transaction stream.")
     return p.parse_args()
 
 
-def build_transaction(row, idx: int, base_ts: datetime) -> dict:
+def build_transaction(row, idx: int, base_ts: datetime, run_id: str) -> dict:
     """
     Build a Kafka transaction message from a CSV row.
 
@@ -77,9 +82,16 @@ def build_transaction(row, idx: int, base_ts: datetime) -> dict:
         base_ts.timestamp() + float(row["Time"]),
         tz=timezone.utc,
     )
+    stable_id = uuid5(
+        NAMESPACE_URL,
+        f"{run_id}|{idx}|{float(row['Time']):.6f}|{float(row['Amount']):.2f}|{int(row['Class'])}",
+    )
     return {
-        "id":         str(uuid.uuid4()),
+        "id":         str(stable_id),
         "amount":     round(float(row["Amount"]), 2),
+        "runId":      run_id,
+        "dataSource": "kaggle-creditcard",
+        "rawLabel":   str(int(row["Class"])),
         # Ground-truth label — used ONLY by GroundTruthJdbcSink in Flink.
         # Not available to the ML model at inference time.
         "status":     "FRAUD" if int(row["Class"]) == 1 else "SUCCESS",
@@ -98,6 +110,15 @@ def main():
         bootstrap_servers=KAFKA,
         value_serializer=lambda v: json.dumps(v).encode(),
         key_serializer=lambda k: k.encode(),
+        # Durability: wait for all in-sync replicas to acknowledge
+        acks="all",
+        # Retry transient broker failures (leader election, network blip)
+        retries=5,
+        retry_backoff_ms=200,
+        # lz4 reduces payload size ~40% with minimal CPU overhead
+        compression_type="lz4",
+        # Larger batch improves throughput during high-speed replay (--speed > 1)
+        batch_size=32 * 1024,
     )
 
     df = pd.read_csv(DATA)
@@ -116,7 +137,7 @@ def main():
     prev_t, sent, fraud = None, 0, 0
 
     for idx, row in df.iterrows():
-        txn = build_transaction(row, idx, base_ts)
+        txn = build_transaction(row, idx, base_ts, args.run_id)
         if prev_t is not None:
             delta = (float(row["Time"]) - prev_t) / args.speed
             if 0 < delta < 5:

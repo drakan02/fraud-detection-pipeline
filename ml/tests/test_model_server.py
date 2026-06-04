@@ -27,6 +27,7 @@ def mock_model_loading():
 
     with patch("ml.model_server._load_version") as mock_load, \
          patch("ml.model_server.REGISTRY_PATH") as mock_reg, \
+         patch("ml.model_server.MODEL_ADMIN_API_KEY", "test-key"), \
          patch("ml.model_server.sync_ch_write") as mock_write, \
          patch("ml.model_server.async_ch_query") as mock_query:
         
@@ -117,6 +118,6 @@ def test_hot_swap_model(client):
         pytest.skip("No models available to test hot-swapping.")
         
     # We'll just hot-swap to the same active version for testing the API
-    response = client.post(f"/models/{active_version}/activate")
+    response = client.post(f"/models/{active_version}/activate", headers={"X-API-Key": "test-key"})
     assert response.status_code == 200
     assert response.json()["status"] == "ok"

@@ -15,9 +15,21 @@ dependencies = [
     "pytest==8.3.2",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
+    "numpy==1.26.4",
+    "xgboost-cpu==3.2.0",
+    "scikit-learn==1.5.1",
+    "imbalanced-learn==0.12.3",
+    "websockets==12.0",
+    "fastapi>=0.111.0",
+    "uvicorn==0.30.1",
+    "joblib==1.4.2",
+    "filelock>=3.14.0",
+    "kafka-python==2.2.15",
+    "lz4==4.3.3",
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
